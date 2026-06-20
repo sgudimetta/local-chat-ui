@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Chat</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="logo">Local Chat</div>
+        <button type="button" id="new-chat" class="btn-new" title="New conversation">+ New chat</button>
+      </div>
+      <div class="sidebar-chats">
+        <div id="chat-list-label" class="chat-list-label">Chats</div>
+        <div id="chat-list" class="chat-list" aria-label="Conversations"></div>
+      </div>
+      <div class="sidebar-controls">
+      <div class="sidebar-section">
+        <label for="model-select">Model</label>
+        <select id="model-select"></select>
+      </div>
+      <div class="sidebar-section">
+        <label class="toggle-row">
+          <input type="checkbox" id="fast-mode" />
+          <span>Fast responses</span>
+        </label>
+        <p class="toggle-hint">Off by default — enable to trade context depth for speed</p>
+        <label class="toggle-row">
+          <input type="checkbox" id="web-search" checked />
+          <span>Search the web</span>
+        </label>
+        <p class="toggle-hint">On by default — live rates, news, current facts</p>
+        <label class="toggle-row">
+          <input type="checkbox" id="unload-on-close" checked />
+          <span>Free RAM when I close this tab</span>
+        </label>
+        <p class="toggle-hint">Unloads the model from memory on exit (recommended)</p>
+      </div>
+      </div>
+      <div class="sidebar-footer">
+        <div class="status-row">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status-text">Connecting…</span>
+        </div>
+        <button type="button" id="stop-btn" class="btn-stop" title="Unload model and stop server">
+          Stop server
+        </button>
+        <p class="footer-hint">Start again: <code>./start.sh</code> in Terminal</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="messages" class="messages">
+        <div class="welcome">
+          <h1>Chat locally</h1>
+          <p>Local Ollama inference · Set per-chat instructions with <code>/system …</code> below</p>
+          <div class="suggestions">
+            <button type="button" class="suggestion" data-prompt="What's the current USD to INR exchange rate?">USD → INR rate</button>
+            <button type="button" class="suggestion" data-prompt="Write a Python function to merge two sorted lists.">Merge sorted lists</button>
+            <button type="button" class="suggestion" data-prompt="Summarize the pros and cons of local vs cloud LLMs.">Local vs cloud LLMs</button>
+          </div>
+        </div>
+      </div>
+
+      <form id="chat-form" class="composer">
+        <div class="composer-inner">
+          <textarea
+            id="user-input"
+            rows="1"
+            placeholder="Type /system instructions for this chat, or just ask…"
+            autofocus
+          ></textarea>
+          <button type="submit" id="send-btn" aria-label="Send">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 19V5M5 12l7-7 7 7"/>
+            </svg>
+          </button>
+        </div>
+        <p class="composer-hint">Per-chat instructions: <code>/system You are a coding expert</code> · clear with <code>/system clear</code></p>
+      </form>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
