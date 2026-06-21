@@ -19,7 +19,45 @@ from web_search import build_web_context
 OLLAMA_BASE = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 PORT = int(os.environ.get("CHAT_UI_PORT", "8080"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+DATA_DIR = Path(os.environ.get("CHAT_UI_DATA_DIR", Path(__file__).resolve().parent / "data"))
+CHATS_FILE = DATA_DIR / "chats.json"
 _http_server: ThreadingHTTPServer | None = None
+_chat_store_lock = threading.Lock()
+
+
+def load_chats_from_disk() -> dict:
+    """Load persisted chats from disk. Returns {activeId, chats, updatedAt}."""
+    with _chat_store_lock:
+        if not CHATS_FILE.is_file():
+            return {"activeId": None, "chats": [], "updatedAt": None}
+        try:
+            data = json.loads(CHATS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"activeId": None, "chats": [], "updatedAt": None}
+            chats = data.get("chats")
+            if not isinstance(chats, list):
+                chats = []
+            return {
+                "activeId": data.get("activeId"),
+                "chats": chats,
+                "updatedAt": data.get("updatedAt"),
+            }
+        except (OSError, json.JSONDecodeError):
+            return {"activeId": None, "chats": [], "updatedAt": None}
+
+
+def save_chats_to_disk(data: dict) -> None:
+    """Atomically persist chats to disk."""
+    payload = {
+        "activeId": data.get("activeId"),
+        "chats": data.get("chats") if isinstance(data.get("chats"), list) else [],
+        "updatedAt": data.get("updatedAt") or int(time.time() * 1000),
+    }
+    with _chat_store_lock:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CHATS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(CHATS_FILE)
 
 
 def unload_ollama_models() -> list[str]:
@@ -60,7 +98,7 @@ class ChatHandler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
 
     def log_message(self, fmt, *args):
-        if args and args[0].startswith("GET /api/"):
+        if args and isinstance(args[0], str) and args[0].startswith("GET /api/"):
             return
         super().log_message(fmt, *args)
 
@@ -75,13 +113,16 @@ class ChatHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/health":
             self._json_response(200, {"ok": True, "ollama": OLLAMA_BASE})
             return
+        if self.path == "/api/chats":
+            self._get_chats()
+            return
         if self.path.startswith("/api/search?"):
             q = urllib.parse.unquote(self.path.split("q=", 1)[-1].split("&")[0]) if "q=" in self.path else ""
             if not q:
                 self._json_response(400, {"error": "Missing q parameter"})
                 return
-            ctx, direct, sources = build_web_context(q)
-            self._json_response(200, {"query": q, "context": ctx, "direct": direct, "sources": sources})
+            result = build_web_context(q)
+            self._json_response(200, {"query": q, **result})
             return
         if self.path in ("/", ""):
             self.path = "/index.html"
@@ -100,10 +141,39 @@ class ChatHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/warmup":
             self._warmup_model()
             return
+        if self.path == "/api/chats":
+            self._put_chats()
+            return
         if self.path == "/api/generate":
             self._proxy_post_raw(f"{OLLAMA_BASE}/api/generate")
             return
         self.send_error(404)
+
+    def do_PUT(self):
+        if self.path == "/api/chats":
+            self._put_chats()
+            return
+        self.send_error(404)
+
+    def _get_chats(self):
+        data = load_chats_from_disk()
+        self._json_response(200, data)
+
+    def _put_chats(self):
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._json_response(400, {"error": "Invalid JSON"})
+            return
+        if not isinstance(payload.get("chats"), list):
+            self._json_response(400, {"error": "Missing chats array"})
+            return
+        try:
+            save_chats_to_disk(payload)
+            self._json_response(200, {"ok": True, "count": len(payload["chats"])})
+        except OSError as e:
+            self._json_response(500, {"error": f"Could not save chats: {e}"})
 
     def _unload_models(self):
         try:
@@ -216,12 +286,22 @@ class ChatHandler(SimpleHTTPRequestHandler):
             return payload, None
 
         messages = payload.get("messages") or []
-        last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        last_user = payload.pop("web_search_query", None) or next(
+            (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+        )
         if not last_user:
             return payload, None
 
-        context, direct, sources = build_web_context(last_user)
-        meta = {"web_search": True, "sources": sources}
+        result = build_web_context(last_user)
+        context = result["context"]
+        direct = result.get("direct_answer")
+        meta = {
+            "web_search": True,
+            "sources": result.get("sources") or [],
+            "handler": result.get("handler"),
+            "source_label": result.get("source_label"),
+            "live_data": bool(result.get("live_data")),
+        }
 
         if direct:
             meta["direct_answer"] = direct
@@ -232,8 +312,12 @@ class ChatHandler(SimpleHTTPRequestHandler):
             m["content"] for m in messages if m.get("role") == "system" and m.get("content")
         )
         web_part = (
-            "The user enabled web search for this turn. Use the live search results below "
-            "for current facts, numbers, and dates. Also remember the conversation history.\n\n"
+            "Web search is enabled for this turn. Answer the user's question directly using "
+            "the live search results below. Give specific facts: dates, times, teams, venues, "
+            "numbers, and names when the results include them.\n\n"
+            "Do NOT tell the user to check websites, apps, or search elsewhere yourself — "
+            "summarize what the search results say. If results are thin or conflicting, say what "
+            "you found and what is uncertain.\n\n"
             f"{context}"
         )
         combined_system = f"{user_system}\n\n{web_part}".strip() if user_system else web_part
@@ -310,6 +394,7 @@ def main():
     _http_server = ThreadingHTTPServer(("127.0.0.1", PORT), ChatHandler)
     print(f"Local Chat UI  →  http://127.0.0.1:{PORT}")
     print(f"Ollama backend →  {OLLAMA_BASE}")
+    print(f"Chats saved to →  {CHATS_FILE}")
     print("Press Ctrl+C to stop, or use 'Stop server' in the UI")
     try:
         _http_server.serve_forever()

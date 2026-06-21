@@ -34,6 +34,7 @@ const DEFAULTS = {
 let chats = [];
 let activeChatId = null;
 let streaming = false;
+let saveServerTimer = null;
 
 function newChatId() {
   return crypto.randomUUID?.() || `chat-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -70,6 +71,7 @@ function titleFromText(text) {
 function displayTitle(chat) {
   if (chat.history.length) return chat.title;
   if (chat.draftTitle && chat.draftTitle !== "New chat") return chat.draftTitle;
+  if (!chat.history.length && !chat.systemPrompt?.trim()) return "New chat";
   return chat.title;
 }
 
@@ -142,6 +144,76 @@ function trimHistory() {
   if (chat) trimHistoryFor(chat);
 }
 
+function persistableChats() {
+  return chats;
+}
+
+function chatsPayload() {
+  return {
+    activeId: null,
+    chats: persistableChats(),
+    updatedAt: Date.now(),
+  };
+}
+
+function applyChatsData(data) {
+  if (!data || !Array.isArray(data.chats)) return false;
+  const parsed = data.chats
+    .filter((c) => c.id && Array.isArray(c.history))
+    .map((c) => ({
+      id: c.id,
+      title: c.title || titleFromHistory(c.history) || "New chat",
+      draftTitle: c.draftTitle || "",
+      systemPrompt: c.systemPrompt || "",
+      history: c.history.filter((m) => m.role && m.content),
+      updatedAt: c.updatedAt || Date.now(),
+    }));
+  chats = parsed;
+  return parsed.length > 0;
+}
+
+function loadChatsFromLocalStorage() {
+  try {
+    const raw = localStorage.getItem(CHATS_KEY);
+    if (!raw) return false;
+    return applyChatsData(JSON.parse(raw));
+  } catch {
+    chats = [];
+    activeChatId = null;
+    return false;
+  }
+}
+
+function saveChatsToLocalStorage() {
+  try {
+    localStorage.setItem(CHATS_KEY, JSON.stringify(chatsPayload()));
+  } catch {
+    for (const chat of chats) {
+      if (chat.id !== activeChatId && chat.history.length > 4) {
+        chat.history = chat.history.slice(-Math.floor(chat.history.length / 2));
+      }
+    }
+    try {
+      localStorage.setItem(CHATS_KEY, JSON.stringify(chatsPayload()));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+async function persistChatsToServer({ keepalive = false } = {}) {
+  try {
+    await fetch("/api/chats", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(chatsPayload()),
+      keepalive,
+    });
+  } catch {
+    /* server may be stopping */
+  }
+}
+
 function saveChats() {
   while (chats.length > MAX_CHATS) {
     const removable = [...chats]
@@ -158,27 +230,10 @@ function saveChats() {
     }
   }
 
-  try {
-    localStorage.setItem(
-      CHATS_KEY,
-      JSON.stringify({
-        activeId: activeChatId,
-        chats,
-      })
-    );
-  } catch {
-    for (const chat of chats) {
-      if (chat.id !== activeChatId && chat.history.length > 4) {
-        chat.history = chat.history.slice(-Math.floor(chat.history.length / 2));
-      }
-    }
-    try {
-      localStorage.setItem(CHATS_KEY, JSON.stringify({ activeId: activeChatId, chats }));
-    } catch {
-      /* ignore */
-    }
-  }
+  saveChatsToLocalStorage();
   renderChatList();
+  clearTimeout(saveServerTimer);
+  saveServerTimer = setTimeout(() => persistChatsToServer(), 300);
 }
 
 function migrateLegacySession() {
@@ -203,38 +258,33 @@ function migrateLegacySession() {
   localStorage.removeItem(LEGACY_CHAT_KEY);
 }
 
-function loadChats() {
+async function loadChats() {
+  let loadedFromServer = false;
+  let serverData = null;
+
   try {
-    const raw = localStorage.getItem(CHATS_KEY);
-    if (raw) {
-      const data = JSON.parse(raw);
-      if (Array.isArray(data.chats)) {
-        chats = data.chats
-          .filter((c) => c.id && Array.isArray(c.history))
-          .map((c) => ({
-            id: c.id,
-            title: c.title || titleFromHistory(c.history) || "New chat",
-            draftTitle: c.draftTitle || "",
-            systemPrompt: c.systemPrompt || "",
-            history: c.history.filter((m) => m.role && m.content),
-            updatedAt: c.updatedAt || Date.now(),
-          }));
-        activeChatId = data.activeId && chats.some((c) => c.id === data.activeId)
-          ? data.activeId
-          : chats[0]?.id || null;
+    const res = await fetch("/api/chats");
+    if (res.ok) {
+      serverData = await res.json();
+      if (Array.isArray(serverData.chats) && serverData.chats.length) {
+        applyChatsData(serverData);
+        loadedFromServer = true;
       }
     }
   } catch {
-    chats = [];
-    activeChatId = null;
+    /* offline or server starting */
+  }
+
+  if (!loadedFromServer) {
+    loadChatsFromLocalStorage();
   }
 
   migrateLegacySession();
 
-  if (!chats.length) {
-    createChat({ activate: true, render: false });
-  } else if (!activeChatId) {
-    activeChatId = chats[0].id;
+  activeChatId = null;
+
+  if (!loadedFromServer && chats.length) {
+    await persistChatsToServer();
   }
 }
 
@@ -309,11 +359,15 @@ function renderChatList() {
 function renderMessages() {
   const chat = getActiveChat();
   messagesEl.innerHTML = "";
-  if (chat?.systemPrompt?.trim()) {
+  if (!chat) {
+    renderWelcome();
+    return;
+  }
+  if (chat.systemPrompt?.trim()) {
     appendSystemBanner(chat.systemPrompt);
   }
-  if (!chat || !chat.history.length) {
-    if (!chat?.systemPrompt?.trim()) renderWelcome();
+  if (!chat.history.length) {
+    if (!chat.systemPrompt?.trim()) renderWelcome();
     return;
   }
   for (const msg of chat.history) {
@@ -392,11 +446,7 @@ function selectChat(id) {
   renderChatList();
   updateComposerPlaceholder();
   userInput.focus();
-  try {
-    localStorage.setItem(CHATS_KEY, JSON.stringify({ activeId: activeChatId, chats }));
-  } catch {
-    /* ignore */
-  }
+  saveChats();
 }
 
 function deleteChat(id, e) {
@@ -408,7 +458,11 @@ function deleteChat(id, e) {
 
   chats = chats.filter((c) => c.id !== id);
   if (!chats.length) {
-    createChat({ activate: true, render: true });
+    activeChatId = null;
+    renderMessages();
+    renderChatList();
+    updateComposerPlaceholder();
+    saveChats();
     return;
   }
   if (activeChatId === id) {
@@ -426,14 +480,114 @@ function saveChat() {
   saveChats();
 }
 
-/** Web search on follow-ups only when the message likely needs live data. */
+/** Only search when the message (or thread) likely needs live/current facts. */
+const WEB_LIVE_TRIGGERS =
+  /\b(current|today|latest|now|live|right now|as of|this week|this month|next|upcoming|202[4-9]|price|prices|cost|rate|rates|exchange|stock|stocks|market|weather|forecast|temperature|rain|snow|humidity|score|scores|news|headline|who won|who is|who's|what is|what's|who is the (current|new)|when is|when's|where is|where's|what time|time in|time is it|when did|what happened|how much is|how much does|usd|eur|inr|gbp|btc|eth|bitcoin|ethereum|solana|dogecoin|crypto|cryptocurrency|schedule|fixture|fixtures|kickoff|kick off|look up|search for|find online|check online|world\s*cup|worldcup|fifa|super bowl|superbowl|olympics|playoffs|tournament|match(?:es)?|game(?:s)?|nfl|nba|mlb|epl|premier league|college football|cfb)\b/i;
+
+const FACTUAL_QUERY =
+  /\b(current|today|now|live|price|rate|weather|forecast|score|who won|who is|what is|when is|where is|what time|time in|how much|next|upcoming|schedule|fixture|bitcoin|crypto|usd|inr|eur|fifa|nfl|nba|mlb)\b/i;
+
+const WEB_CREATIVE_SKIP =
+  /\b(draft|write|compose|rewrite|proofread|edit|email|e-mail|letter|message to|subject line|cover letter|resume|cv|essay|poem|story|blog|tone|grammar|spelling|translate|summarize|summary|explain|teach me|help me (with|understand|draft|write)|create a|generate a|brainstorm|ideas for|outline|reply to|respond to|thank you note|make it (sound|shorter|longer)|in my own words|conversation|chat about|roleplay|pretend)\b/i;
+
+const WEB_FORCE_PREFIX = /^\/search\s+/i;
+
+function recentThreadLooksCreative(chat) {
+  if (!chat?.history?.length) return false;
+  const recent = chat.history
+    .slice(-6)
+    .map((m) => m.content)
+    .join(" ");
+  return WEB_CREATIVE_SKIP.test(recent);
+}
+
 function shouldWebSearch(text) {
   if (!webSearchToggle?.checked) return false;
   const chat = getActiveChat();
-  if (!chat || chat.history.length <= 1) return true;
-  return /\b(current|today|latest|now|live|price|rate|news|weather|score|stock|exchange|usd|eur|inr|gbp|who is|what happened|how much|when did)\b/i.test(
-    text
+  let t = text.trim();
+  if (!t) return false;
+
+  if (WEB_FORCE_PREFIX.test(t)) return true;
+
+  if (WEB_LIVE_TRIGGERS.test(t)) return true;
+  if (WEB_CREATIVE_SKIP.test(t)) return false;
+
+  if (chat?.history.length > 1) {
+    if (recentThreadLooksCreative(chat)) return false;
+    return false;
+  }
+
+  return false;
+}
+
+function queryForWebSearch(text) {
+  return text.trim().replace(WEB_FORCE_PREFIX, "").trim();
+}
+
+function isCreativeQuery(text) {
+  return WEB_CREATIVE_SKIP.test(text.trim());
+}
+
+function pickModelForTurn(text) {
+  const selected = modelSelect.value;
+  if (!selected || isCreativeQuery(text)) return selected;
+  if (!shouldWebSearch(text) || !FACTUAL_QUERY.test(text)) return selected;
+  const models = [...modelSelect.options].map((o) => o.value).filter(Boolean);
+  const fastFactual = models.find(
+    (m) => /(?:^|:)1b$|:1b-instruct|:3b$/.test(m) && !/32b|70b|14b/.test(m)
   );
+  return fastFactual || selected;
+}
+
+function getMessageBody(messageEl) {
+  if (!messageEl) return null;
+  let body = messageEl.querySelector(".message-body");
+  if (body) return body;
+  const content = messageEl.querySelector(".message-content");
+  if (!content) return messageEl;
+  body = document.createElement("div");
+  body.className = "message-body";
+  content.parentNode.insertBefore(body, content);
+  body.appendChild(content);
+  return body;
+}
+
+function renderSourceChips(messageEl, searchMeta) {
+  if (!messageEl || !searchMeta) return;
+  const body = getMessageBody(messageEl);
+  body.querySelector(".message-sources")?.remove();
+  const label = searchMeta.source_label;
+  const sources = searchMeta.sources || [];
+  if (!label && !sources.length) return;
+
+  const wrap = document.createElement("div");
+  wrap.className = "message-sources";
+
+  if (label) {
+    const chip = document.createElement("span");
+    chip.className = `source-chip${searchMeta.live_data ? " live" : ""}`;
+    chip.textContent = searchMeta.live_data ? `Live · ${label.replace(/^Live ·\s*/, "")}` : label;
+    wrap.appendChild(chip);
+  }
+
+  const seen = new Set();
+  for (const src of sources.slice(0, 3)) {
+    const title = src.title || "Source";
+    if (seen.has(title)) continue;
+    seen.add(title);
+    const chip = document.createElement("span");
+    chip.className = "source-chip source-link";
+    chip.title = src.snippet || title;
+    if (src.url && !src.url.startsWith("local://")) {
+      const href = src.url.startsWith("//") ? `https:${src.url}` : src.url;
+      chip.innerHTML = `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(title.slice(0, 48))}</a>`;
+    } else {
+      chip.textContent = title.slice(0, 48);
+    }
+    wrap.appendChild(chip);
+  }
+
+  body.appendChild(wrap);
 }
 
 function saveSettings() {
@@ -602,7 +756,9 @@ function appendMessage(role, content, { streaming: isStream = false } = {}) {
   const roleLabel = role === "user" ? "You" : "Assistant";
   wrap.innerHTML = `
     <div class="message-role">${roleLabel}</div>
-    <div class="message-content${isStream ? " cursor-blink" : ""}">${formatContent(content)}</div>
+    <div class="message-body">
+      <div class="message-content${isStream ? " cursor-blink" : ""}">${formatContent(content)}</div>
+    </div>
   `;
   messagesEl.appendChild(wrap);
   messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -615,12 +771,15 @@ function buildPayload() {
   const sys = chat?.systemPrompt?.trim();
   if (sys) msgs.push({ role: "system", content: sys });
   msgs.push(...(chat?.history || []));
+  const lastUser = chat?.history[chat.history.length - 1]?.content || "";
+  const useWeb = shouldWebSearch(lastUser);
   return {
-    model: modelSelect.value,
+    model: pickModelForTurn(lastUser),
     messages: msgs,
     stream: true,
     fast_mode: fastModeToggle?.checked ?? false,
-    web_search: shouldWebSearch(chat?.history[chat.history.length - 1]?.content || ""),
+    web_search: useWeb,
+    web_search_query: useWeb ? queryForWebSearch(lastUser) : undefined,
   };
 }
 
@@ -653,7 +812,7 @@ async function sendMessage(text) {
   if (useWeb) {
     const wrap = document.createElement("div");
     wrap.className = "message assistant message-searching";
-    wrap.innerHTML = `<div class="message-role">Assistant</div><div class="message-content">Searching the web…</div>`;
+    wrap.innerHTML = `<div class="message-role">Assistant</div><div class="message-body"><div class="message-content">Searching the web…</div></div>`;
     messagesEl.appendChild(wrap);
     contentEl = wrap.querySelector(".message-content");
   } else {
@@ -688,7 +847,9 @@ async function sendMessage(text) {
         if (!line.trim()) continue;
         const chunk = JSON.parse(line);
         if (chunk.search_meta) {
-          contentEl.closest(".message")?.classList.remove("message-searching");
+          const messageEl = contentEl.closest(".message");
+          messageEl?.classList.remove("message-searching");
+          renderSourceChips(messageEl, chunk.search_meta);
           if (!full) contentEl.innerHTML = "";
           contentEl.classList.add("cursor-blink");
         }
@@ -722,7 +883,27 @@ async function sendMessage(text) {
 
 function newChat() {
   if (streaming) return;
-  createChat({ activate: true, render: true });
+
+  const current = getActiveChat();
+  if (current && !current.history.length && !current.systemPrompt?.trim()) {
+    userInput.value = "";
+    userInput.style.height = "auto";
+    updateComposerPlaceholder();
+    userInput.focus();
+    renderChatList();
+    return;
+  }
+
+  const chat = createChat({ activate: true, render: false });
+  if (!chat) return;
+
+  userInput.value = "";
+  userInput.style.height = "auto";
+  renderMessages();
+  renderChatList();
+  updateComposerPlaceholder();
+  userInput.focus();
+  saveChats();
 }
 
 let draftTitleTimer = null;
@@ -765,7 +946,7 @@ chatForm.addEventListener("submit", (e) => {
   sendMessage(text);
 });
 
-newChatBtn.addEventListener("click", newChat);
+newChatBtn?.addEventListener("click", newChat);
 stopBtn.addEventListener("click", stopServer);
 
 webSearchToggle.addEventListener("change", saveSettings);
@@ -778,17 +959,25 @@ unloadOnCloseToggle.addEventListener("change", saveSettings);
 modelSelect.addEventListener("change", warmModel);
 
 window.addEventListener("beforeunload", () => {
+  clearTimeout(saveServerTimer);
+  persistChatsToServer({ keepalive: true });
   if (unloadOnCloseToggle.checked) unloadModels();
 });
 window.addEventListener("pagehide", () => {
+  clearTimeout(saveServerTimer);
+  persistChatsToServer({ keepalive: true });
   if (unloadOnCloseToggle.checked) unloadModels();
 });
 
-loadSettings();
-loadChats();
-renderChatList();
-renderMessages();
-saveChats();
-updateComposerPlaceholder();
-bindSuggestions();
-loadModels();
+async function bootstrap() {
+  loadSettings();
+  await loadChats();
+  renderChatList();
+  renderMessages();
+  saveChats();
+  updateComposerPlaceholder();
+  bindSuggestions();
+  loadModels();
+}
+
+bootstrap();
