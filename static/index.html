@@ -29,6 +29,14 @@
       </div>
       <div class="sidebar-controls">
       <div class="sidebar-section">
+        <label for="repo-path">Project folder</label>
+        <div class="repo-row">
+          <input type="text" id="repo-path" class="repo-path" placeholder="/path/to/your/repo" spellcheck="false" />
+          <button type="button" id="repo-set-btn" class="btn-repo-set" title="Set project folder">Set</button>
+        </div>
+        <p id="repo-hint" class="toggle-hint">Used by Agent, Plan &amp; Debug modes</p>
+      </div>
+      <div class="sidebar-section">
         <label for="model-select">Model</label>
         <select id="model-select"></select>
         <p id="model-hint" class="toggle-hint"></p>
@@ -70,7 +78,7 @@
       <div id="messages" class="messages">
         <div class="welcome">
           <h1>Chat locally</h1>
-          <p>Local Ollama inference · Set per-chat instructions with <code>/system …</code> below</p>
+          <p>Local Ollama inference · Pick a mode below the chat box</p>
           <div class="suggestions">
             <button type="button" class="suggestion" data-prompt="What's the current USD to INR exchange rate?">USD → INR rate</button>
             <button type="button" class="suggestion" data-prompt="Write a Python function to merge two sorted lists.">Merge sorted lists</button>
@@ -80,7 +88,42 @@
       </div>
 
       <form id="chat-form" class="composer">
+        <div id="attachment-preview" class="attachment-preview hidden"></div>
+        <div class="composer-toolbar">
+          <div class="mode-picker" id="mode-picker">
+            <button type="button" id="mode-trigger" class="mode-pill" aria-haspopup="listbox" aria-expanded="false">
+              <span class="mode-pill-icon" id="mode-icon" aria-hidden="true">💬</span>
+              <span id="mode-label">Ask</span>
+              <svg class="mode-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+            </button>
+            <div id="mode-menu" class="mode-menu hidden" role="listbox" aria-label="Chat mode">
+              <button type="button" class="mode-option" data-mode="agent" role="option">
+                <span class="mode-option-icon">∞</span>
+                <span class="mode-option-text"><strong>Agent</strong><small>Read &amp; edit project · you approve writes</small></span>
+                <span class="mode-option-kbd">⌘I</span>
+              </button>
+              <button type="button" class="mode-option" data-mode="plan" role="option">
+                <span class="mode-option-icon">☰</span>
+                <span class="mode-option-text"><strong>Plan</strong><small>Explore codebase · read-only plan</small></span>
+              </button>
+              <button type="button" class="mode-option" data-mode="debug" role="option">
+                <span class="mode-option-icon">🐛</span>
+                <span class="mode-option-text"><strong>Debug</strong><small>Trace errors · propose fixes</small></span>
+              </button>
+              <button type="button" class="mode-option" data-mode="ask" role="option">
+                <span class="mode-option-icon">💬</span>
+                <span class="mode-option-text"><strong>Ask</strong><small>Chat only · no repo tools</small></span>
+              </button>
+            </div>
+          </div>
+        </div>
         <div class="composer-inner">
+          <input type="file" id="file-input" multiple hidden />
+          <button type="button" id="attach-btn" class="composer-attach" title="Attach file" aria-label="Attach file">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+            </svg>
+          </button>
           <textarea
             id="user-input"
             rows="1"
@@ -96,9 +139,20 @@
             </svg>
           </button>
         </div>
-        <p class="composer-hint">Stop: <kbd>Esc</kbd> · New chat: <kbd>⌘N</kbd> · Force search: <code>/search …</code></p>
+        <p class="composer-hint" id="mode-hint">Ask mode — plain chat · Set project folder for Agent/Plan/Debug</p>
       </form>
     </main>
+  </div>
+  <div id="write-approval" class="write-approval hidden" role="dialog" aria-label="Approve file change">
+    <div class="write-approval-card">
+      <h3>Approve file change?</h3>
+      <p id="write-approval-path" class="write-approval-path"></p>
+      <pre id="write-approval-preview" class="write-approval-preview"></pre>
+      <div class="write-approval-actions">
+        <button type="button" id="write-reject" class="message-action">Reject</button>
+        <button type="button" id="write-approve" class="btn-new">Approve &amp; write</button>
+      </div>
+    </div>
   </div>
   <script src="/app.js"></script>
 </body>

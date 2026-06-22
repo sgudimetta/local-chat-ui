@@ -11,10 +11,58 @@ const chatListEl = document.getElementById("chat-list");
 const chatListLabel = document.getElementById("chat-list-label");
 const chatSearchInput = document.getElementById("chat-search");
 const modelHintEl = document.getElementById("model-hint");
+const repoPathInput = document.getElementById("repo-path");
+const repoSetBtn = document.getElementById("repo-set-btn");
+const repoHintEl = document.getElementById("repo-hint");
+const modeTrigger = document.getElementById("mode-trigger");
+const modeMenu = document.getElementById("mode-menu");
+const modeLabel = document.getElementById("mode-label");
+const modeIcon = document.getElementById("mode-icon");
+const modeHintEl = document.getElementById("mode-hint");
+const modePicker = document.getElementById("mode-picker");
 
 const webSearchToggle = document.getElementById("web-search");
+const fileInput = document.getElementById("file-input");
+const attachmentPreview = document.getElementById("attachment-preview");
+const writeApprovalEl = document.getElementById("write-approval");
+const writeApprovalPath = document.getElementById("write-approval-path");
+const writeApprovalPreview = document.getElementById("write-approval-preview");
+const writeApproveBtn = document.getElementById("write-approve");
+const writeRejectBtn = document.getElementById("write-reject");
+const attachBtn = document.getElementById("attach-btn");
 const fastModeToggle = document.getElementById("fast-mode");
 const unloadOnCloseToggle = document.getElementById("unload-on-close");
+
+const CHAT_MODES = {
+  agent: {
+    label: "Agent",
+    icon: "∞",
+    hint: "Explores your project automatically · file edits need your approval",
+    needsRepo: true,
+    activity: "Working in your project",
+  },
+  plan: {
+    label: "Plan",
+    icon: "☰",
+    hint: "Read-only codebase exploration · outputs a structured plan",
+    needsRepo: true,
+    activity: "Exploring your project",
+  },
+  debug: {
+    label: "Debug",
+    icon: "🐛",
+    hint: "Traces errors in your codebase · proposes fixes for approval",
+    needsRepo: true,
+    activity: "Debugging your project",
+  },
+  ask: {
+    label: "Ask",
+    icon: "💬",
+    hint: "Plain chat · attach files or images to analyze",
+    needsRepo: false,
+    activity: "Thinking through your question",
+  },
+};
 
 const SETTINGS_KEY = "localChat.settings";
 const CHATS_KEY = "localChat.chats";
@@ -30,6 +78,8 @@ const DEFAULTS = {
   webSearch: true,
   fastMode: false,
   unloadOnClose: true,
+  chatMode: "ask",
+  repoPath: "",
 };
 
 /** @type {{ id: string, title: string, draftTitle?: string, systemPrompt: string, history: { role: string, content: string }[], updatedAt: number }[]} */
@@ -41,6 +91,66 @@ let chatFilterQuery = "";
 let streamAbort = null;
 let systemRamGb = null;
 let availableModels = [];
+/** @type {{ kind: 'image'|'file', name: string, dataUrl?: string, base64?: string, text?: string, truncated?: boolean }[]} */
+let pendingAttachments = [];
+
+const MAX_ATTACH_BYTES = 512 * 1024;
+const MAX_ATTACH_TEXT_CHARS = 48_000;
+const MAX_ATTACH_COUNT = 5;
+/** Extensions we know are binary — everything else is attempted as text. */
+const BINARY_EXT = new Set([
+  ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tar",
+  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+  ".exe", ".dll", ".dmg", ".pkg", ".deb", ".rpm", ".msi",
+  ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac",
+  ".wasm", ".bin", ".iso", ".img",
+  ".woff", ".woff2", ".ttf", ".otf", ".eot",
+  ".pyc", ".pyo", ".class", ".o", ".so", ".dylib", ".a",
+  ".apk", ".ipa",
+]);
+
+function hasAttachments() {
+  return pendingAttachments.length > 0;
+}
+
+function hasImageAttachments() {
+  return pendingAttachments.some((a) => a.kind === "image");
+}
+
+function attachmentPayload() {
+  const fromPending = pendingAttachments
+    .filter((a) => a.kind === "file" && a.text)
+    .map((a) => ({ name: a.name, text: a.text, truncated: a.truncated }));
+  if (fromPending.length) return fromPending;
+  const chat = getActiveChat();
+  const last = chat?.history?.[chat.history.length - 1];
+  if (last?.role === "user" && last._attachments?.length) return last._attachments;
+  return [];
+}
+
+function embedAttachmentsInMessages(msgs, files) {
+  if (!files.length) return msgs;
+  const blocks = files.map(
+    (f) =>
+      `### ${f.name}${f.truncated ? " (truncated)" : ""}\n\`\`\`\n${f.text}\n\`\`\``,
+  );
+  const fileSection = blocks.join("\n\n");
+  const out = msgs.map((m) => ({ ...m }));
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i].role === "user") {
+      const ask = (out[i].content || "").trim() || "Analyze the attached file(s).";
+      out[i].content =
+        `${ask}\n\n` +
+        `[${files.length} attached file(s) — respond using this content only]\n\n` +
+        fileSection;
+      break;
+    }
+  }
+  return out;
+}
+let repoRoot = null;
+let pendingAgentState = null;
+let chatMode = "ask";
 
 function newChatId() {
   return crypto.randomUUID?.() || `chat-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -101,10 +211,40 @@ function parseSystemCommand(text) {
   return { isCommand: true, prompt: body };
 }
 
+function setChatMode(mode) {
+  if (!CHAT_MODES[mode]) mode = "ask";
+  chatMode = mode;
+  if (modeLabel) modeLabel.textContent = CHAT_MODES[mode].label;
+  if (modeIcon) modeIcon.textContent = CHAT_MODES[mode].icon;
+  if (modeHintEl) modeHintEl.textContent = CHAT_MODES[mode].hint;
+  modeMenu?.querySelectorAll(".mode-option").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+  });
+  updateComposerPlaceholder();
+  saveSettings();
+}
+
+function toggleModeMenu(open) {
+  if (!modeMenu || !modeTrigger) return;
+  const show = open ?? modeMenu.classList.contains("hidden");
+  modeMenu.classList.toggle("hidden", !show);
+  modeTrigger.setAttribute("aria-expanded", show ? "true" : "false");
+}
+
+function isRepoMode() {
+  return CHAT_MODES[chatMode]?.needsRepo === true;
+}
+
 function updateComposerPlaceholder() {
   const chat = getActiveChat();
   if (!chat) {
-    userInput.placeholder = "Type /system instructions for this chat, or just ask…";
+    if (isRepoMode()) {
+      userInput.placeholder = repoRoot
+        ? `${CHAT_MODES[chatMode].label} mode — ask about your project…`
+        : "Set project folder in sidebar first…";
+    } else {
+      userInput.placeholder = "Ask anything…";
+    }
     return;
   }
   if (chat.systemPrompt?.trim()) {
@@ -126,6 +266,8 @@ function loadSettings() {
     webSearchToggle.checked = saved.webSearch ?? DEFAULTS.webSearch;
     fastModeToggle.checked = saved.fastMode ?? DEFAULTS.fastMode;
     unloadOnCloseToggle.checked = saved.unloadOnClose ?? DEFAULTS.unloadOnClose;
+    if (saved.chatMode) setChatMode(saved.chatMode);
+    if (repoPathInput && saved.repoPath) repoPathInput.value = saved.repoPath;
     const panel = document.getElementById("settings-panel");
     if (panel) panel.open = saved.optionsOpen ?? false;
     if (chatSearchInput && saved.chatSearch) {
@@ -146,6 +288,8 @@ function saveSettings() {
       webSearch: webSearchToggle.checked,
       fastMode: fastModeToggle.checked,
       unloadOnClose: unloadOnCloseToggle.checked,
+      chatMode,
+      repoPath: repoPathInput?.value?.trim() || "",
       optionsOpen: document.getElementById("settings-panel")?.open ?? false,
       model: modelSelect?.value || "",
       chatSearch: chatFilterQuery,
@@ -679,6 +823,14 @@ const DEFAULT_ASSISTANT_PROMPT =
   "Answer from your own knowledge for explanations, writing, coding, advice, and comparisons. " +
   "Do not tell the user to search the web or check external sites.";
 
+const ATTACHMENT_SYSTEM_PROMPT =
+  "The user attached file(s). The FULL file contents are in their message below.\n\n" +
+  "You MUST:\n" +
+  "- Read and analyze the ACTUAL file contents\n" +
+  "- Answer the user's question using what's IN those files\n" +
+  "- NEVER give generic advice about 'how to analyze' or analysis frameworks\n" +
+  "- If they say 'Analyze', analyze THE ATTACHED FILE(S), not analysis in general";
+
 const CODING_QUERY =
   /\b(code|function|class|method|bug|error|stack\s*trace|regex|refactor|implement|debug|compile|syntax|typescript|javascript|python|kotlin|rust|golang|react|vue|angular|spring\s*boot|dockerfile|sql|api\s+endpoint|unit\s+test)\b/i;
 
@@ -705,9 +857,313 @@ function isCreativeQuery(text) {
 function pickModelForTurn(text) {
   const selected = modelSelect.value;
   const t = text.trim();
+  if (hasImageAttachments()) {
+    const vision = pickVisionModel(availableModels);
+    if (vision) return vision;
+  }
   if (!t || needsFactVerification(t) || !CODING_QUERY.test(t)) return selected;
   const coder = pickCoderModel(availableModels);
   return coder || selected;
+}
+
+function pickVisionModel(models) {
+  const priority = [
+    (m) => /llava|llama3\.2-vision|bakllava|moondream|minicpm-v|qwen2\.5vl|qwen3-vl/i.test(m),
+  ];
+  for (const test of priority) {
+    const match = models.find(test);
+    if (match) return match;
+  }
+  return models.find((m) => /vision|vl|llava/i.test(m)) || null;
+}
+
+async function loadRepoRoot() {
+  try {
+    const res = await fetch("/api/repo");
+    if (!res.ok) return;
+    const data = await res.json();
+    repoRoot = data.root || null;
+    if (repoRoot && repoPathInput && !repoPathInput.value) {
+      repoPathInput.value = repoRoot;
+    }
+    updateRepoHint();
+  } catch {
+    /* ignore */
+  }
+}
+
+function updateRepoHint() {
+  if (!repoHintEl) return;
+  if (repoRoot) {
+    repoHintEl.textContent = repoRoot
+      ? `Project: ${repoRoot.split("/").slice(-2).join("/")}`
+      : "Set folder for Agent, Plan & Debug modes";
+  }
+}
+
+async function setRepoPath(path) {
+  const res = await fetch("/api/repo", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Could not set project folder");
+  repoRoot = data.root;
+  if (repoPathInput) repoPathInput.value = repoRoot;
+  saveSettings();
+  updateRepoHint();
+  return repoRoot;
+}
+
+function renderAttachmentPreview() {
+  if (!attachmentPreview) return;
+  attachmentPreview.innerHTML = "";
+  if (!pendingAttachments.length) {
+    attachmentPreview.classList.add("hidden");
+    return;
+  }
+  attachmentPreview.classList.remove("hidden");
+  pendingAttachments.forEach((att, idx) => {
+    const chip = document.createElement("div");
+    chip.className = "attachment-chip";
+    if (att.kind === "image") {
+      chip.innerHTML = `<img src="${att.dataUrl}" alt="" /><button type="button" aria-label="Remove">×</button>`;
+    } else {
+      chip.innerHTML = `<span class="attachment-file-icon">📄</span><span class="attachment-file-name">${escapeHtml(att.name)}</span><button type="button" aria-label="Remove">×</button>`;
+    }
+    chip.querySelector("button").addEventListener("click", () => {
+      pendingAttachments.splice(idx, 1);
+      renderAttachmentPreview();
+    });
+    attachmentPreview.appendChild(chip);
+  });
+}
+
+function fileExtension(name) {
+  const m = name.match(/(\.[^./\\]+)$/);
+  return m ? m[1].toLowerCase() : "";
+}
+
+function isKnownBinaryFile(file) {
+  const ext = fileExtension(file.name);
+  if (BINARY_EXT.has(ext)) return true;
+  if (file.type.startsWith("video/") || file.type.startsWith("audio/")) return true;
+  if (file.type === "application/pdf" || file.type === "application/zip") return true;
+  return false;
+}
+
+function looksLikeBinaryText(text) {
+  if (!text) return false;
+  const sample = text.slice(0, 12_000);
+  let control = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const c = sample.charCodeAt(i);
+    if (c === 0 || (c < 32 && c !== 9 && c !== 10 && c !== 13)) control++;
+  }
+  return control / sample.length > 0.03;
+}
+
+async function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
+
+async function addAttachmentFile(file) {
+  if (!file) return;
+  if (pendingAttachments.length >= MAX_ATTACH_COUNT) {
+    alert(`Maximum ${MAX_ATTACH_COUNT} attachments`);
+    return;
+  }
+  if (file.size > MAX_ATTACH_BYTES) {
+    alert(`"${file.name}" is too large (max ${MAX_ATTACH_BYTES / 1024} KB)`);
+    return;
+  }
+
+  const isImage =
+    file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|svg|heic|heif)$/i.test(file.name);
+
+  if (isImage) {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+    const base64 = String(dataUrl).split(",")[1] || "";
+    pendingAttachments.push({ kind: "image", name: file.name, dataUrl, base64 });
+    const vision = pickVisionModel(availableModels);
+    if (vision && modelSelect) {
+      modelSelect.value = vision;
+      updateModelHint(availableModels);
+    }
+  } else {
+    if (isKnownBinaryFile(file)) {
+      alert(`"${file.name}" looks like a binary file and can't be read as text.\nImages are supported via the same attach button.`);
+      return;
+    }
+    let text;
+    try {
+      text = await readFileAsText(file);
+    } catch {
+      alert(`Could not read "${file.name}" as text.`);
+      return;
+    }
+    if (looksLikeBinaryText(text)) {
+      alert(`"${file.name}" appears to be binary, not text.`);
+      return;
+    }
+    let truncated = false;
+    if (text.length > MAX_ATTACH_TEXT_CHARS) {
+      text = text.slice(0, MAX_ATTACH_TEXT_CHARS);
+      truncated = true;
+    }
+    pendingAttachments.push({ kind: "file", name: file.name, text, truncated });
+  }
+  renderAttachmentPreview();
+}
+
+function showWriteApproval(proposal) {
+  return new Promise((resolve) => {
+    if (!writeApprovalEl) {
+      resolve(false);
+      return;
+    }
+    writeApprovalPath.textContent = proposal.path;
+    writeApprovalPreview.textContent = proposal.content;
+    writeApprovalEl.classList.remove("hidden");
+
+    function cleanup(result) {
+      writeApprovalEl.classList.add("hidden");
+      writeApproveBtn.removeEventListener("click", onApprove);
+      writeRejectBtn.removeEventListener("click", onReject);
+      resolve(result);
+    }
+    function onApprove() {
+      cleanup(true);
+    }
+    function onReject() {
+      cleanup(false);
+    }
+    writeApproveBtn.addEventListener("click", onApprove);
+    writeRejectBtn.addEventListener("click", onReject);
+  });
+}
+
+function renderAgentSteps(container, steps) {
+  if (!steps?.length || !container) return;
+  const details = document.createElement("details");
+  details.className = "agent-steps";
+  details.open = false;
+  const summary = document.createElement("summary");
+  summary.textContent = `Agent used ${steps.length} tool step(s)`;
+  const list = document.createElement("div");
+  for (const s of steps) {
+    const line = document.createElement("div");
+    line.textContent = `• ${s.tool}${s.args?.path ? `: ${s.args.path}` : ""}`;
+    list.appendChild(line);
+  }
+  details.appendChild(summary);
+  details.appendChild(list);
+  container.appendChild(details);
+}
+
+async function runAgent(chat, userText) {
+  streaming = true;
+  setComposerStreaming(true);
+  const modeCfg = CHAT_MODES[chatMode] || CHAT_MODES.agent;
+  const placeholder = createAssistantPlaceholder(false, false, false);
+  placeholder.setActivity(modeCfg.activity);
+  const messageWrap = placeholder.wrap;
+  const contentEl = placeholder.contentEl;
+  streamAbort = new AbortController();
+
+  const buildMsgs = () => {
+    const msgs = [];
+    const sys = chat?.systemPrompt?.trim();
+    if (sys) msgs.push({ role: "system", content: sys });
+    for (const m of chat.history) {
+      msgs.push({ role: m.role, content: m.content });
+    }
+    return msgs;
+  };
+
+  try {
+    let messages = buildMsgs();
+    let finalContent = "";
+    let allSteps = [];
+
+    while (true) {
+      const res = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: pickModelForTurn(userText),
+          messages: pendingAgentState?.messages || messages,
+          mode: chatMode,
+          fast_mode: fastModeToggle?.checked ?? false,
+          approved_write: pendingAgentState?.approved_write,
+          attachments: attachmentPayload(),
+        }),
+        signal: streamAbort.signal,
+      });
+      const approvedWrite = pendingAgentState?.approved_write;
+      pendingAgentState = null;
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Agent request failed");
+
+      if (data.steps?.length) allSteps = allSteps.concat(data.steps);
+      messages = data.messages || messages;
+
+      if (data.status === "awaiting_approval" && data.proposal) {
+        placeholder.setActivity("Waiting for your approval");
+        const approved = await showWriteApproval(data.proposal);
+        if (approved) {
+          pendingAgentState = { approved_write: data.proposal, messages };
+          placeholder.setActivity("Applying change");
+          continue;
+        }
+        messages.push({
+          role: "user",
+          content: "[Tool result]\nUser rejected the proposed file write.",
+        });
+        continue;
+      }
+
+      if (data.status === "error") throw new Error(data.error || "Agent failed");
+      finalContent = data.content || "";
+      break;
+    }
+
+    placeholder.clearActivity();
+    if (finalContent) {
+      contentEl.innerHTML = formatContent(finalContent);
+      renderAgentSteps(messageWrap.querySelector(".message-body"), allSteps);
+      chat.history.push({ role: "assistant", content: finalContent });
+      trimHistoryFor(chat);
+      chat.updatedAt = Date.now();
+      await flushChats();
+      attachMessageActions(messageWrap, "assistant", finalContent);
+    } else {
+      messageWrap.remove();
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      placeholder.clearActivity();
+      contentEl.innerHTML = `<span class="thinking">Error: ${escapeHtml(e.message)}</span>`;
+    } else {
+      messageWrap.remove();
+    }
+  } finally {
+    streaming = false;
+    streamAbort = null;
+    setComposerStreaming(false);
+    userInput.focus();
+  }
 }
 
 function getMessageBody(messageEl) {
@@ -1058,15 +1514,25 @@ function visibleAssistantText(raw) {
   return text.trimStart();
 }
 
-function appendMessage(role, content, { streaming: isStream = false, showActions = false } = {}) {
+function appendMessage(role, content, { streaming: isStream = false, showActions = false, images = [], files = [] } = {}) {
   clearWelcome();
   const wrap = document.createElement("div");
   wrap.className = `message ${role}`;
   const roleLabel = role === "user" ? "You" : "Assistant";
+  let imageHtml = "";
+  for (const src of images) {
+    imageHtml += `<img class="message-image" src="${src}" alt="Attached image" />`;
+  }
+  let fileHtml = "";
+  if (files.length) {
+    fileHtml = `<div class="message-files">${files.map((f) => `<span class="message-file-chip">📄 ${escapeHtml(f)}</span>`).join("")}</div>`;
+  }
   wrap.innerHTML = `
     <div class="message-role">${roleLabel}</div>
     <div class="message-body">
       <div class="message-content${isStream ? " cursor-blink" : ""}">${formatContent(content)}</div>
+      ${fileHtml}
+      ${imageHtml}
     </div>
   `;
   messagesEl.appendChild(wrap);
@@ -1146,20 +1612,28 @@ function stopGeneration() {
 
 function buildPayload() {
   const chat = getActiveChat();
+  const files = attachmentPayload();
   const msgs = [];
   const sys = chat?.systemPrompt?.trim();
   const lastUser = chat?.history[chat.history.length - 1]?.content || "";
   const verify = needsFactVerification(lastUser);
-  const useWeb = shouldWebSearch(lastUser);
+  const useWeb = files.length ? false : shouldWebSearch(lastUser);
   if (sys) {
-    msgs.push({ role: "system", content: sys });
+    msgs.push({
+      role: "system",
+      content: files.length ? `${sys}\n\n${ATTACHMENT_SYSTEM_PROMPT}` : sys,
+    });
   } else if (!useWeb) {
-    msgs.push({ role: "system", content: DEFAULT_ASSISTANT_PROMPT });
+    msgs.push({
+      role: "system",
+      content: files.length ? ATTACHMENT_SYSTEM_PROMPT : DEFAULT_ASSISTANT_PROMPT,
+    });
   }
   msgs.push(...(chat?.history || []));
-  return {
+  const finalMsgs = files.length ? embedAttachmentsInMessages(msgs, files) : msgs;
+  const payload = {
     model: pickModelForTurn(lastUser),
-    messages: msgs,
+    messages: finalMsgs,
     stream: true,
     fast_mode: fastModeToggle?.checked ?? false,
     web_search: useWeb,
@@ -1167,11 +1641,17 @@ function buildPayload() {
     verify_facts: verify,
     web_search_query: useWeb ? queryForWebSearch(lastUser) : undefined,
   };
+  if (hasImageAttachments()) {
+    payload.images = pendingAttachments.filter((a) => a.kind === "image").map((a) => a.base64);
+  }
+  if (files.length) payload.attachments = files;
+  return payload;
 }
 
 async function sendMessage(text, { regenerate = false } = {}) {
   const trimmed = text.trim();
-  if (!trimmed || streaming || !modelSelect.value) return;
+  const attached = hasAttachments();
+  if ((!trimmed && !attached) || streaming || !modelSelect.value) return;
 
   let chat = getActiveChat();
   if (!chat) {
@@ -1183,18 +1663,46 @@ async function sendMessage(text, { regenerate = false } = {}) {
     return;
   }
 
+  const fileNames = pendingAttachments.filter((a) => a.kind === "file").map((a) => a.name);
+  const imageUrls = pendingAttachments.filter((a) => a.kind === "image").map((a) => a.dataUrl);
+  const attachLabel = [];
+  if (fileNames.length) attachLabel.push(`${fileNames.length} file(s)`);
+  if (imageUrls.length) attachLabel.push(`${imageUrls.length} image(s)`);
+  const displayText = trimmed || (attachLabel.length ? `(see attached ${attachLabel.join(", ")})` : "");
+
   if (!regenerate) {
-    chat.history.push({ role: "user", content: trimmed });
-    chat.title = titleFromText(trimmed);
+    const filePayload = pendingAttachments
+      .filter((a) => a.kind === "file" && a.text)
+      .map((a) => ({ name: a.name, text: a.text, truncated: a.truncated }));
+    chat.history.push({
+      role: "user",
+      content: displayText,
+      attachNote: attachLabel.length ? attachLabel.join(", ") : undefined,
+      _attachments: filePayload.length ? filePayload : undefined,
+    });
+    chat.title = titleFromText(displayText);
     chat.draftTitle = "";
     chat.updatedAt = Date.now();
     renderChatList();
     trimHistoryFor(chat);
-    appendMessage("user", trimmed);
+    appendMessage("user", displayText, { images: imageUrls, files: fileNames });
     saveChats();
   }
 
-  await runGeneration(chat, trimmed);
+  const useAgent = isRepoMode() && repoRoot && !hasImageAttachments() && !attachmentPayload().length;
+  if (isRepoMode() && !repoRoot) {
+    appendSystemNotice("Set your **project folder** in the sidebar to use " + CHAT_MODES[chatMode].label + " mode.");
+    pendingAttachments = [];
+    renderAttachmentPreview();
+    return;
+  }
+  if (useAgent) {
+    await runAgent(chat, displayText);
+  } else {
+    await runGeneration(chat, displayText);
+  }
+  pendingAttachments = [];
+  renderAttachmentPreview();
 }
 
 async function regenerateLast() {
@@ -1433,6 +1941,43 @@ fastModeToggle.addEventListener("change", () => {
   warmModel();
 });
 unloadOnCloseToggle.addEventListener("change", saveSettings);
+modeTrigger?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  toggleModeMenu();
+});
+modeMenu?.querySelectorAll(".mode-option").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    setChatMode(btn.dataset.mode);
+    toggleModeMenu(false);
+  });
+});
+document.addEventListener("click", (e) => {
+  if (!modePicker?.contains(e.target)) toggleModeMenu(false);
+});
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "i") {
+    e.preventDefault();
+    setChatMode("agent");
+    userInput.focus();
+  }
+});
+repoSetBtn?.addEventListener("click", async () => {
+  const path = repoPathInput?.value?.trim();
+  if (!path) return;
+  try {
+    await setRepoPath(path);
+    appendSystemNotice(`Project folder set to:\n\n${repoRoot}`);
+  } catch (e) {
+    appendSystemNotice(`Could not set project folder: ${e.message}`);
+  }
+});
+attachBtn?.addEventListener("click", () => fileInput?.click());
+fileInput?.addEventListener("change", () => {
+  for (const file of fileInput.files || []) {
+    addAttachmentFile(file);
+  }
+  fileInput.value = "";
+});
 document.getElementById("settings-panel")?.addEventListener("toggle", saveSettings);
 modelSelect.addEventListener("change", () => {
   saveSettings();
@@ -1460,7 +2005,16 @@ document.addEventListener("keydown", (e) => {
 
 async function bootstrap() {
   loadSettings();
+  setChatMode(chatMode);
   await loadChats();
+  await loadRepoRoot();
+  if (repoPathInput?.value?.trim() && !repoRoot) {
+    try {
+      await setRepoPath(repoPathInput.value.trim());
+    } catch {
+      /* saved path may be invalid on this machine */
+    }
+  }
   renderChatList();
   renderMessages();
   updateComposerPlaceholder();

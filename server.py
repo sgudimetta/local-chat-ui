@@ -16,6 +16,16 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from web_search import build_web_context, query_needs_verification
+from repo_tools import (
+    get_repo_root,
+    grep_repo,
+    list_tree,
+    load_file_context,
+    read_file,
+    set_repo_root,
+    write_file,
+)
+from agent import run_agent
 
 OLLAMA_BASE = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 PORT = int(os.environ.get("CHAT_UI_PORT", "8080"))
@@ -140,6 +150,13 @@ class ChatHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/system":
             self._json_response(200, {"ram_gb": system_ram_gb()})
             return
+        if self.path == "/api/repo":
+            root = get_repo_root()
+            self._json_response(200, {"root": str(root) if root else None})
+            return
+        if self.path.startswith("/api/repo/tree"):
+            self._repo_tree()
+            return
         if self.path == "/api/chats":
             self._get_chats()
             return
@@ -158,6 +175,21 @@ class ChatHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/chat":
             self._proxy_chat_stream()
+            return
+        if self.path == "/api/agent":
+            self._run_agent()
+            return
+        if self.path == "/api/repo":
+            self._set_repo()
+            return
+        if self.path == "/api/repo/read":
+            self._repo_read()
+            return
+        if self.path == "/api/repo/grep":
+            self._repo_grep()
+            return
+        if self.path == "/api/repo/write":
+            self._repo_write()
             return
         if self.path == "/api/unload":
             self._unload_models()
@@ -319,6 +351,181 @@ class ChatHandler(SimpleHTTPRequestHandler):
         except urllib.error.URLError as e:
             self._json_response(502, {"error": str(e)})
 
+    def _set_repo(self):
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._json_response(400, {"error": "Invalid JSON"})
+            return
+        path = (payload.get("path") or "").strip()
+        if not path:
+            self._json_response(400, {"error": "Missing path"})
+            return
+        try:
+            root = set_repo_root(path)
+            self._json_response(200, {"ok": True, "root": str(root)})
+        except ValueError as e:
+            self._json_response(400, {"error": str(e)})
+
+    def _repo_tree(self):
+        q = urllib.parse.urlparse(self.path).query
+        sub = ""
+        if q:
+            sub = urllib.parse.parse_qs(q).get("path", [""])[0]
+        try:
+            entries = list_tree(sub)
+            self._json_response(200, {"entries": entries, "root": str(get_repo_root())})
+        except ValueError as e:
+            self._json_response(400, {"error": str(e)})
+
+    def _repo_read(self):
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._json_response(400, {"error": "Invalid JSON"})
+            return
+        try:
+            data = read_file(payload.get("path", ""))
+            self._json_response(200, data)
+        except ValueError as e:
+            self._json_response(400, {"error": str(e)})
+
+    def _repo_grep(self):
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._json_response(400, {"error": "Invalid JSON"})
+            return
+        try:
+            matches = grep_repo(payload.get("pattern", ""), payload.get("path", ""))
+            self._json_response(200, {"matches": matches})
+        except ValueError as e:
+            self._json_response(400, {"error": str(e)})
+
+    def _repo_write(self):
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._json_response(400, {"error": "Invalid JSON"})
+            return
+        try:
+            result = write_file(payload.get("path", ""), payload.get("content", ""))
+            self._json_response(200, result)
+        except ValueError as e:
+            self._json_response(400, {"error": str(e)})
+
+    def _run_agent(self):
+        body = self._read_body()
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            self._json_response(400, {"error": "Invalid JSON"})
+            return
+        model = payload.get("model", "llama3.1:8b")
+        fast = payload.get("fast_mode", False)
+        messages = payload.get("messages") or []
+        approved = payload.get("approved_write")
+        attachments = payload.get("attachments")
+        mode = payload.get("mode", "agent")
+        result = run_agent(
+            messages,
+            model=model,
+            mode=mode,
+            fast_mode=fast,
+            approved_write=approved,
+            perf_options=self._perf_options(fast),
+            attachments=attachments,
+        )
+        self._json_response(200, result)
+
+    def _inject_repo_context(self, payload: dict) -> None:
+        messages = payload.get("messages") or []
+        last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        if not last_user:
+            return
+        text = last_user.get("content") or ""
+        if isinstance(text, list):
+            text = " ".join(
+                p.get("text", "") for p in text if isinstance(p, dict) and p.get("type") == "text"
+            )
+        ctx = load_file_context(text)
+        if not ctx:
+            return
+        root = get_repo_root()
+        header = f"Project root: {root}\n\n{ctx}" if root else ctx
+        sys_msg = {"role": "system", "content": header}
+        out = []
+        inserted = False
+        for m in messages:
+            if m.get("role") == "system" and not inserted:
+                out.append({"role": "system", "content": f"{m.get('content', '')}\n\n{header}".strip()})
+                inserted = True
+            else:
+                out.append(m)
+        if not inserted:
+            out.insert(0, sys_msg)
+        payload["messages"] = out
+
+    def _inject_attachments(self, payload: dict) -> None:
+        attachments = payload.pop("attachments", None)
+        if not attachments:
+            return
+        blocks: list[str] = []
+        for raw in attachments:
+            if not isinstance(raw, dict):
+                continue
+            name = raw.get("name") or "file"
+            text = raw.get("text") or ""
+            if not text.strip():
+                continue
+            note = " (truncated)" if raw.get("truncated") else ""
+            blocks.append(f"--- Attached: {name}{note} ---\n{text}")
+        if not blocks:
+            return
+        header = (
+            "IMPORTANT: The user attached files. Their FULL contents are in the user message below.\n"
+            "Analyze the ACTUAL file contents. Do NOT give generic 'how to analyze' advice.\n\n"
+            + "\n\n".join(blocks)
+        )
+        messages = payload.get("messages") or []
+        inserted = False
+        out = []
+        for m in messages:
+            if m.get("role") == "system" and not inserted:
+                out.append({"role": "system", "content": f"{m.get('content', '')}\n\n{header}".strip()})
+                inserted = True
+            else:
+                out.append(m)
+        if not inserted:
+            out.insert(0, {"role": "system", "content": header})
+        # Ensure last user message includes file text (fallback if client didn't embed)
+        for i in range(len(out) - 1, -1, -1):
+            if out[i].get("role") == "user":
+                content = out[i].get("content") or ""
+                if blocks[0][:40] not in content:
+                    names = ", ".join(raw.get("name", "file") for raw in attachments if isinstance(raw, dict))
+                    out[i]["content"] = (
+                        f"{content.strip() or 'Analyze the attached file(s).'}\n\n"
+                        f"[Attached: {names}]\n\n" + "\n\n".join(blocks)
+                    )
+                break
+        payload["messages"] = out
+
+    def _prepare_messages_for_ollama(self, payload: dict) -> None:
+        """Ensure user messages with images use Ollama multimodal format."""
+        images = payload.pop("images", None)
+        if not images:
+            return
+        messages = payload.get("messages") or []
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                m["images"] = images
+                break
+
     def _inject_web_search(self, payload: dict) -> tuple[dict, dict | None]:
         """If web_search enabled, enrich messages. Returns (payload, meta)."""
         use_web = payload.pop("web_search", False)
@@ -402,7 +609,10 @@ class ChatHandler(SimpleHTTPRequestHandler):
             self._json_response(400, {"error": "Invalid JSON"})
             return
 
+        self._inject_attachments(payload)
         payload, search_meta = self._inject_web_search(payload)
+        self._inject_repo_context(payload)
+        self._prepare_messages_for_ollama(payload)
         model = payload.get("model", "llama3.1:8b")
         self._apply_perf_options(payload)
 
@@ -460,6 +670,9 @@ def main():
     print(f"Local Chat UI  →  http://127.0.0.1:{PORT}")
     print(f"Ollama backend →  {OLLAMA_BASE}")
     print(f"Chats saved to →  {CHATS_FILE}")
+    root = get_repo_root()
+    if root:
+        print(f"Project root   →  {root}")
     print("Press Ctrl+C to stop, or use 'Stop server' in the UI")
     try:
         _http_server.serve_forever()

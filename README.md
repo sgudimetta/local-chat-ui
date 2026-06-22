@@ -158,6 +158,32 @@ Try a few more live queries:
 - **Edit** — on your last message, click **Edit** to change it and resend
 - **Copy** — copy the last assistant reply to clipboard
 
+### Project folder
+
+Set **Project folder** in the sidebar (or env `CHAT_UI_REPO`). Required for Agent, Plan, and Debug modes.
+
+### Chat modes (composer picker)
+
+| Mode | What it does |
+|------|----------------|
+| **Ask** | Plain chat — no repo access |
+| **Agent** | Auto-explores your project · proposes file edits (you approve) |
+| **Plan** | Read-only exploration · structured implementation plan |
+| **Debug** | Traces errors · proposes fixes for approval |
+
+Shortcut: **⌘I** switches to Agent mode.
+
+Relevant files are gathered automatically from your question — no `@file` syntax needed.
+
+### Attach files
+
+Click the **paperclip** to attach up to 5 files (512 KB each):
+
+- **Any text-based file** — source code, config, logs, CSV, markdown, etc. (extension-agnostic; binary files like PDF/zip are skipped)
+- **Images** — analyzed with a vision model when available
+
+The model reads attached file contents and analyzes them in context. Ask e.g. *"Explain this code"* or *"Find bugs in the attached file."*
+
 ### Per-chat instructions
 
 Set behavior for **this chat only** in the message box:
