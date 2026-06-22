@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -14,7 +15,7 @@ import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from web_search import build_web_context
+from web_search import build_web_context, query_needs_verification
 
 OLLAMA_BASE = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 PORT = int(os.environ.get("CHAT_UI_PORT", "8080"))
@@ -47,10 +48,24 @@ def load_chats_from_disk() -> dict:
 
 
 def save_chats_to_disk(data: dict) -> None:
-    """Atomically persist chats to disk."""
+    """Atomically persist chats to disk, merging with existing by id."""
+    incoming = data.get("chats") if isinstance(data.get("chats"), list) else []
+    existing = load_chats_from_disk().get("chats") or []
+    by_id: dict[str, dict] = {}
+    for raw in existing:
+        if isinstance(raw, dict) and raw.get("id"):
+            by_id[str(raw["id"])] = raw
+    for raw in incoming:
+        if not isinstance(raw, dict) or not raw.get("id"):
+            continue
+        cid = str(raw["id"])
+        prev = by_id.get(cid)
+        if not prev or (raw.get("updatedAt") or 0) >= (prev.get("updatedAt") or 0):
+            by_id[cid] = raw
+    merged = sorted(by_id.values(), key=lambda c: c.get("updatedAt") or 0, reverse=True)
     payload = {
         "activeId": data.get("activeId"),
-        "chats": data.get("chats") if isinstance(data.get("chats"), list) else [],
+        "chats": merged,
         "updatedAt": data.get("updatedAt") or int(time.time() * 1000),
     }
     with _chat_store_lock:
@@ -58,6 +73,15 @@ def save_chats_to_disk(data: dict) -> None:
         tmp = CHATS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(CHATS_FILE)
+
+
+def system_ram_gb() -> int | None:
+    """Best-effort total RAM in GB (macOS sysctl)."""
+    try:
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+        return round(int(out) / (1024**3))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def unload_ollama_models() -> list[str]:
@@ -112,6 +136,9 @@ class ChatHandler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/health":
             self._json_response(200, {"ok": True, "ollama": OLLAMA_BASE})
+            return
+        if self.path == "/api/system":
+            self._json_response(200, {"ram_gb": system_ram_gb()})
             return
         if self.path == "/api/chats":
             self._get_chats()
@@ -228,8 +255,21 @@ class ChatHandler(SimpleHTTPRequestHandler):
     @staticmethod
     def _perf_options(fast: bool) -> dict:
         if fast:
-            return {"num_ctx": 4096, "num_predict": 1024, "num_batch": 512}
-        return {"num_ctx": 8192, "num_predict": 2048, "num_batch": 512}
+            return {
+                "num_ctx": 4096,
+                "num_predict": 1024,
+                "num_batch": 512,
+                "temperature": 0.7,
+                "top_p": 0.9,
+            }
+        return {
+            "num_ctx": 8192,
+            "num_predict": 3072,
+            "num_batch": 512,
+            "temperature": 0.55,
+            "top_p": 0.92,
+            "repeat_penalty": 1.08,
+        }
 
     def _apply_perf_options(self, payload: dict) -> None:
         fast = payload.pop("fast_mode", False)
@@ -286,21 +326,29 @@ class ChatHandler(SimpleHTTPRequestHandler):
             return payload, None
 
         messages = payload.get("messages") or []
+        force_search = payload.pop("web_search_force", False)
+        verify_facts = payload.pop("verify_facts", False)
         last_user = payload.pop("web_search_query", None) or next(
             (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
         )
         if not last_user:
             return payload, None
 
-        result = build_web_context(last_user)
+        verify_facts = verify_facts or query_needs_verification(last_user)
+        if verify_facts:
+            force_search = True
+
+        result = build_web_context(last_user, force_search=force_search)
         context = result["context"]
         direct = result.get("direct_answer")
+        verify_facts = verify_facts or bool(result.get("verify_facts"))
         meta = {
             "web_search": True,
             "sources": result.get("sources") or [],
             "handler": result.get("handler"),
             "source_label": result.get("source_label"),
             "live_data": bool(result.get("live_data")),
+            "verify_facts": verify_facts,
         }
 
         if direct:
@@ -311,15 +359,32 @@ class ChatHandler(SimpleHTTPRequestHandler):
         user_system = "\n\n".join(
             m["content"] for m in messages if m.get("role") == "system" and m.get("content")
         )
-        web_part = (
-            "Web search is enabled for this turn. Answer the user's question directly using "
-            "the live search results below. Give specific facts: dates, times, teams, venues, "
-            "numbers, and names when the results include them.\n\n"
-            "Do NOT tell the user to check websites, apps, or search elsewhere yourself — "
-            "summarize what the search results say. If results are thin or conflicting, say what "
-            "you found and what is uncertain.\n\n"
-            f"{context}"
-        )
+        if verify_facts:
+            web_part = (
+                "This question needs VERIFIED facts (versions, releases, dates, support status).\n\n"
+                "Rules — follow strictly:\n"
+                "1. Base version numbers, release dates, and any 'latest/current' claim ONLY on "
+                "the reference material below and its 'Today is …' line.\n"
+                "2. If your training memory disagrees with the reference, trust the reference.\n"
+                "3. If the reference is thin or conflicting, say you could not fully verify and "
+                "give only what the sources support — do NOT guess from memory.\n"
+                "4. Answer in your own words with a polished, structured reply.\n"
+                "5. Never tell the user to search elsewhere.\n\n"
+                f"{context}"
+            )
+        else:
+            web_part = (
+                "Reference material from the web is provided below. Use it thoughtfully:\n\n"
+                "1. Silently clarify what the user needs and how the reference material applies.\n"
+                "2. Answer in your own words with a polished, structured reply — no visible planning "
+                "or pasted search snippets.\n"
+                "3. Use the reference only for facts that must be current or verified "
+                "(numbers, dates, names, scores, rates).\n"
+                "4. For reasoning, comparison, or follow-ups, rely on your analysis and chat context.\n"
+                "5. If the reference is thin or conflicting, say so briefly and reason from what you know.\n"
+                "6. Never tell the user to check websites or search elsewhere.\n\n"
+                f"{context}"
+            )
         combined_system = f"{user_system}\n\n{web_part}".strip() if user_system else web_part
         web_system = {"role": "system", "content": combined_system}
         out = [web_system]

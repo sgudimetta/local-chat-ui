@@ -75,7 +75,11 @@ sysctl -n hw.memsize | awk '{print $0/1024/1024/1024 " GB RAM"}'
 |----------|-------------|---------|
 | 16 GB | Llama 3.1 8B | `ollama pull llama3.1:8b` |
 | 16 GB | Llama 3.2 1B (faster, weaker) | `ollama pull llama3.2:1b` |
-| 32–64 GB | Qwen3 32B or DeepSeek-R1 32B | `ollama pull qwen3:32b` |
+| 32–64 GB | Qwen3 32B (best general) | `ollama pull qwen3:32b` |
+| 32–64 GB | Qwen2.5 Coder 32B (coding) | `ollama pull qwen2.5-coder:32b` |
+| 32–64 GB | DeepSeek-R1 32B (reasoning) | `ollama pull deepseek-r1:32b` |
+
+On a **64 GB personal Mac**, the UI auto-selects a 32B model if installed and shows a hint under the model picker. Your model choice is remembered across sessions.
 
 Starter command (works on most Macs):
 
@@ -138,13 +142,21 @@ Try a few more live queries:
 
 ### Multiple chats
 
-- **+ New chat** — creates a new conversation in the sidebar (up to 100 chats)
-- Click any chat in the sidebar to switch
-- **×** on hover deletes a chat
-- Chat names auto-update from your first message (e.g. *"movie recommendations"*)
-- While typing in a new chat, the sidebar title updates live in *italics*
-- Chats are saved to `data/chats.json` on disk and survive restarts
-- On open/refresh, the **welcome screen** shows in the main area — click a chat in the sidebar to continue it
+- **+ New chat** — always creates a new conversation in the sidebar (up to **100** chats, including blank ones)
+- **Recent** list on the left — all saved chats, newest first (like Claude/Cowork)
+- Click any chat to switch; **×** on hover deletes it
+- Chat names auto-update from your first message
+- **All chats persist** across refresh and server restart (`data/chats.json` + browser backup)
+- On open/refresh you land on the **welcome screen** — your chats stay in the sidebar; click one to continue
+- Creating a new chat **never removes** existing chats
+- **Search chats** — filter the sidebar by title, instructions, or message text
+
+### Stop, regenerate, edit
+
+- **Stop** — click the orange stop button (or press **Esc**) while the assistant is generating
+- **Regenerate** — on the last assistant reply, click **Regenerate** to try again
+- **Edit** — on your last message, click **Edit** to change it and resend
+- **Copy** — copy the last assistant reply to clipboard
 
 ### Per-chat instructions
 
@@ -179,6 +191,26 @@ When live data is found, answers appear instantly with **source chips** under th
 | Facts | "who is …", "what is …" | Wikipedia / DuckDuckGo |
 
 Creative tasks (draft email, write code, explain a concept) **do not** trigger web search unless you use `/search`.
+
+**Verify before answering** — questions about *latest* versions, release dates, or support status (e.g. *"when was the latest Java version released?"*) automatically:
+1. Search the web first (you'll see **Checking sources…**)
+2. Instruct the model to trust sources over its memory
+3. Show source chips under the answer
+
+Coding questions auto-use a **coder model** for that turn if you have one installed (e.g. `qwen2.5-coder:32b`), without changing your sidebar selection.
+
+### Local models vs Claude / ChatGPT
+
+This app runs **Ollama locally** — no API keys, no cloud bill, private on your Mac.
+
+| | Local Chat (Ollama) | Claude Opus / Sonnet |
+|--|---------------------|----------------------|
+| Cost | Free (your hardware) | Paid API subscription |
+| Privacy | Stays on your Mac | Sent to Anthropic servers |
+| Recency | Training cutoff + web verify | Very current training + tools |
+| Setup | `ollama pull …` | API key in a cloud app |
+
+**Claude is not built into this app** — it would need an Anthropic API key and a different architecture. For comparable local quality on a 64 GB Mac, use **Qwen3 32B** or **DeepSeek-R1 32B** plus web verify for version/release facts.
 
 ### Sidebar toggles
 

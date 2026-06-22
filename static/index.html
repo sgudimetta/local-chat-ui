@@ -14,31 +14,45 @@
         <button type="button" id="new-chat" class="btn-new" title="New conversation">+ New chat</button>
       </div>
       <div class="sidebar-chats">
-        <div id="chat-list-label" class="chat-list-label">Chats</div>
+        <div class="chat-list-header">
+          <div id="chat-list-label" class="chat-list-label">Recent</div>
+          <input
+            type="search"
+            id="chat-search"
+            class="chat-search"
+            placeholder="Search chats…"
+            autocomplete="off"
+            aria-label="Search chats"
+          />
+        </div>
         <div id="chat-list" class="chat-list" aria-label="Conversations"></div>
       </div>
       <div class="sidebar-controls">
       <div class="sidebar-section">
         <label for="model-select">Model</label>
         <select id="model-select"></select>
+        <p id="model-hint" class="toggle-hint"></p>
       </div>
-      <div class="sidebar-section">
-        <label class="toggle-row">
-          <input type="checkbox" id="fast-mode" />
-          <span>Fast responses</span>
-        </label>
-        <p class="toggle-hint">Off by default — enable to trade context depth for speed</p>
-        <label class="toggle-row">
-          <input type="checkbox" id="web-search" checked />
-          <span>Search the web</span>
-        </label>
-        <p class="toggle-hint">On by default — live rates, news, current facts</p>
-        <label class="toggle-row">
-          <input type="checkbox" id="unload-on-close" checked />
-          <span>Free RAM when I close this tab</span>
-        </label>
-        <p class="toggle-hint">Unloads the model from memory on exit (recommended)</p>
-      </div>
+      <details class="sidebar-collapsible" id="settings-panel">
+        <summary class="sidebar-collapsible-summary">Options</summary>
+        <div class="sidebar-collapsible-body">
+          <label class="toggle-row">
+            <input type="checkbox" id="fast-mode" />
+            <span>Fast responses</span>
+          </label>
+          <p class="toggle-hint">Off by default — enable for quicker but less polished replies</p>
+          <label class="toggle-row">
+            <input type="checkbox" id="web-search" checked />
+            <span>Search the web</span>
+          </label>
+          <p class="toggle-hint">Smart mode — verifies versions/releases online; live facts for weather, rates, scores</p>
+          <label class="toggle-row">
+            <input type="checkbox" id="unload-on-close" checked />
+            <span>Free RAM when I close this tab</span>
+          </label>
+          <p class="toggle-hint">Unloads the model from memory on exit (recommended)</p>
+        </div>
+      </details>
       </div>
       <div class="sidebar-footer">
         <div class="status-row">
@@ -73,13 +87,16 @@
             placeholder="Type /system instructions for this chat, or just ask…"
             autofocus
           ></textarea>
-          <button type="submit" id="send-btn" aria-label="Send">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <button type="submit" id="send-btn" class="composer-send" aria-label="Send">
+            <svg class="icon-send" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M12 19V5M5 12l7-7 7 7"/>
+            </svg>
+            <svg class="icon-stop" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <rect x="6" y="6" width="12" height="12" rx="1"/>
             </svg>
           </button>
         </div>
-        <p class="composer-hint">Live facts: auto-detected · force search with <code>/search …</code> · per-chat instructions: <code>/system …</code></p>
+        <p class="composer-hint">Stop: <kbd>Esc</kbd> · New chat: <kbd>⌘N</kbd> · Force search: <code>/search …</code></p>
       </form>
     </main>
   </div>

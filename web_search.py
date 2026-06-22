@@ -113,8 +113,60 @@ WIKI_PATTERN = re.compile(
 
 DIRECT_INTENT = re.compile(
     r"(?i)\b(current|today|now|live|right now|what'?s|what is|how much|price|"
-    r"next|upcoming|when|where|who is|who's|forecast|score|time in|time is it)\b"
+    r"next|upcoming|when|where|forecast|score|time in|time is it)\b"
 )
+
+FORCE_SEARCH_PREFIX = re.compile(r"(?i)^/search\s+")
+
+LOCAL_ONLY_PATTERN = re.compile(
+    r"(?i)\b(explain|why\s+(?:is|are|do|does|did)|how\s+(?:do|does|can|to)|help me understand|"
+    r"what(?:'s| is) the difference|compare|pros and cons|draft|write|compose|rewrite|joke|"
+    r"brainstorm|summarize|summary|translate|debug|teach me|walk me through|recommend|suggest)\b"
+)
+
+LIVE_REQUIRED_PATTERN = re.compile(
+    r"(?i)\b(current|today'?s?|latest|right now|as of now|as of today|this week|this month|live)\b|"
+    r"\b(weather|forecast|temperature)\b.*\b(today|tomorrow|now|in\s+\w)|"
+    r"\b(weather|forecast)\s+(?:in|for|at)\s+|"
+    r"\b(exchange rate|forex|usd\s*to|eur\s*to|inr\s*to|gbp\s*to)\b|"
+    r"\b(bitcoin|ethereum|crypto|btc|eth)\s*(price|cost|worth)?\b|"
+    r"\b(what time is it|time in\s+)\b|"
+    r"\b(who won|final score|live score)\b|"
+    r"\b(next\s+(?:game|match|fixture)|upcoming\s+(?:game|match))\b|"
+    r"\b(world\s*cup|worldcup|fifa|nfl|nba|mlb)\b.*\b(next|schedule|score|today|live)\b|"
+    r"\b(look up online|search the web|search online|find online|check online)\b"
+)
+
+VERIFY_FACTS_PATTERN = re.compile(
+    r"(?i)"
+    r"\b(latest|current|newest|most recent)\b.{0,40}\b("
+    r"version|release|jdk|java\s*se?|openjdk|python|node\.?js|typescript|golang|\bgo\b|rust|"
+    r"kotlin|swift|react|angular|vue|spring|\.net|dotnet|ubuntu|debian|macos|ios|android|"
+    r"chrome|firefox|safari|windows|llama|ollama|gpt|claude|gemini"
+    r")\b|"
+    r"\b(what|which)\s+(?:is\s+)?(?:the\s+)?(?:latest|current|newest)\b|"
+    r"\bwhen\s+(?:was|is)\s+.+\b(?:released|launched|announced|general availability|ga)\b|"
+    r"\b(?:is|are)\s+.+\b(?:still\s+supported|end[- ]of[- ]life|eol)\b|"
+    r"\b(?:release\s+date|ga\s+date)\s+of\b"
+)
+
+
+def query_needs_verification(query: str) -> bool:
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip()
+    if LOCAL_ONLY_PATTERN.search(q):
+        return False
+    return bool(VERIFY_FACTS_PATTERN.search(q))
+
+
+def query_needs_internet(query: str, *, force_search: bool = False) -> bool:
+    if force_search:
+        return True
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip()
+    if LOCAL_ONLY_PATTERN.search(q):
+        return False
+    if query_needs_verification(q):
+        return True
+    return bool(LIVE_REQUIRED_PATTERN.search(q))
 
 _response_cache: dict[str, tuple[float, dict]] = {}
 
@@ -304,6 +356,9 @@ def extract_facts_from_results(results: list[dict]) -> list[str]:
 
 
 def refine_search_query(query: str) -> str:
+    if query_needs_verification(query):
+        year = date.today().year
+        return f"{query.strip()} latest official release date {year}"
     if re.search(r"(?i)\b(world\s*cup|worldcup|fifa)\b", query) and re.search(
         r"(?i)\b(next|upcoming|schedule|fixture|when|where|match|game)\b", query
     ):
@@ -760,13 +815,13 @@ def handle_wikipedia(query: str) -> HandlerResult | None:
     snippet = extract if len(extract) <= 900 else extract[:900].rsplit(" ", 1)[0] + "…"
     answer = f"**{topic.title()}** (via Wikipedia):\n\n{snippet}"
     return HandlerResult(
-        direct_answer=answer,
-        context_blocks=[answer],
+        direct_answer=None,
+        context_blocks=[f"Wikipedia reference for {topic.title()}:\n{snippet}"],
         sources=[{"title": f"Wikipedia · {topic.title()}", "snippet": snippet[:300], "url": wiki_url}],
         handler="wikipedia",
         source_label="Wikipedia",
-        live_data=True,
-        use_direct=True,
+        live_data=False,
+        use_direct=False,
     )
 
 
@@ -781,15 +836,14 @@ def handle_ddg_instant(query: str) -> HandlerResult | None:
     if not hit:
         return None
     answer = f"**{hit['title']}**\n\n{hit['snippet']}"
-    use_direct = bool(DIRECT_INTENT.search(query))
     return HandlerResult(
-        direct_answer=answer if use_direct else None,
-        context_blocks=[answer],
+        direct_answer=None,
+        context_blocks=[f"Reference:\n{answer}"],
         sources=[{"title": hit["title"], "snippet": hit["snippet"], "url": hit["url"]}],
         handler="ddg_instant",
         source_label="DuckDuckGo Instant Answer",
-        live_data=True,
-        use_direct=use_direct,
+        live_data=False,
+        use_direct=False,
     )
 
 
@@ -799,14 +853,18 @@ HANDLERS: list[tuple[str, object]] = [
     ("crypto", handle_crypto),
     ("weather", handle_weather),
     ("espn", handle_espn_sports),
+]
+
+REFERENCE_HANDLERS: list[tuple[str, object]] = [
     ("wikipedia", handle_wikipedia),
     ("ddg_instant", handle_ddg_instant),
 ]
 
 
-def run_handlers(query: str) -> HandlerResult:
+def run_handlers(query: str, *, include_reference: bool = False) -> HandlerResult:
     merged = HandlerResult()
-    for _name, handler in HANDLERS:
+    handlers = HANDLERS + (REFERENCE_HANDLERS if include_reference else [])
+    for _name, handler in handlers:
         try:
             result = handler(query)
         except Exception:
@@ -828,17 +886,20 @@ def run_handlers(query: str) -> HandlerResult:
     return merged
 
 
-def build_web_context(query: str) -> dict:
+def build_web_context(query: str, *, force_search: bool = False) -> dict:
     """
     Returns dict with: context, direct_answer, sources, handler, source_label, live_data.
+    Direct answers only for truly live data (FX, weather, sports, etc.).
     """
-    cache_key = query.strip().lower()
+    cache_key = f"{force_search}|{query.strip().lower()}"
     cached = _cache_get(cache_key)
     if cached:
         return cached
 
     now_line = _now_line()
-    handler_out = run_handlers(query)
+    needs_verify = query_needs_verification(query)
+    include_reference = force_search or needs_verify
+    handler_out = run_handlers(query, include_reference=include_reference)
 
     fx_block = ""
     pair = detect_fx_pair(query)
@@ -850,25 +911,36 @@ def build_web_context(query: str) -> dict:
             handler_out.sources.append(
                 {"title": f"Live FX: {pair[0]}/{pair[1]}", "snippet": fx_block, "url": "https://open.er-api.com"}
             )
+            if LIVE_REQUIRED_PATTERN.search(query) and not handler_out.direct_answer:
+                handler_out.direct_answer = fx_block
+                handler_out.use_direct = True
+                handler_out.handler = handler_out.handler or "fx"
+                handler_out.source_label = handler_out.source_label or "Live · open.er-api.com"
+                handler_out.live_data = True
         except (urllib.error.URLError, ValueError, KeyError):
             pass
 
-    search_query = refine_search_query(query)
     results: list[dict] = []
-    try:
-        results = search_duckduckgo(search_query, max_results=5)
-        handler_out.sources.extend(results)
-    except urllib.error.URLError as e:
-        if not handler_out.context_blocks and not handler_out.direct_answer:
-            out = {
-                "context": f"Web search failed: {e}",
-                "direct_answer": None,
-                "sources": handler_out.sources,
-                "handler": handler_out.handler,
-                "source_label": handler_out.source_label,
-                "live_data": handler_out.live_data,
-            }
-            return out
+    run_scrape = force_search or needs_verify or (
+        query_needs_internet(query, force_search=force_search)
+        and not handler_out.direct_answer
+    )
+    if run_scrape:
+        search_query = refine_search_query(query)
+        try:
+            results = search_duckduckgo(search_query, max_results=5)
+            handler_out.sources.extend(results)
+        except urllib.error.URLError as e:
+            if not handler_out.context_blocks and not handler_out.direct_answer:
+                out = {
+                    "context": f"Web search failed: {e}",
+                    "direct_answer": None,
+                    "sources": handler_out.sources,
+                    "handler": handler_out.handler,
+                    "source_label": handler_out.source_label,
+                    "live_data": handler_out.live_data,
+                }
+                return out
 
     extracted = extract_facts_from_results(results) if results else []
     lines = [now_line, ""]
@@ -885,7 +957,12 @@ def build_web_context(query: str) -> dict:
         _cache_set(cache_key, out)
         return out
 
-    lines.append("Web search results (use these — they are more current than your training data):")
+    lines.append("Reference material (use for facts only — reason and synthesize in your own words):")
+    if needs_verify:
+        lines.append(
+            "VERIFICATION REQUIRED: version numbers, release dates, and 'latest/current' claims "
+            "must come from these sources — not from model memory."
+        )
     lines.append("")
     for block in handler_out.context_blocks:
         lines.extend([block, ""])
@@ -906,6 +983,7 @@ def build_web_context(query: str) -> dict:
         "handler": handler_out.handler,
         "source_label": handler_out.source_label,
         "live_data": handler_out.live_data,
+        "verify_facts": needs_verify,
     }
     _cache_set(cache_key, out)
     return out
