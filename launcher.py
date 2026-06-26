@@ -346,6 +346,15 @@ class LauncherHandler(SimpleHTTPRequestHandler):
             result = stop_worker(unload_models=True)
             self._json(200, result)
             return True
+        if path == "/api/system" and self.command == "GET":
+            from system_monitor import build_system_snapshot
+
+            self._json(200, build_system_snapshot())
+            return True
+        if path == "/api/unload" and self.command == "POST":
+            unloaded = _unload_ollama()
+            self._json(200, {"ok": True, "unloaded": unloaded})
+            return True
         return False
 
     def _handle_chats_local(self, body: bytes = b"") -> bool:

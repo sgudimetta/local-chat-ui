@@ -59,10 +59,39 @@
             <span>Free RAM when I close this tab</span>
           </label>
           <p class="toggle-hint">Unloads the model from memory on exit (recommended)</p>
+          <label class="toggle-row">
+            <input type="checkbox" id="low-ram-mode" />
+            <span>Low RAM mode</span>
+          </label>
+          <p class="toggle-hint">Keep models in RAM for 2–5 min instead of 30 — essential on 8 GB Macs sharing RAM with Cursor</p>
+          <label class="toggle-row">
+            <input type="checkbox" id="auto-unload-pressure" checked />
+            <span>Auto-free RAM when system is choking</span>
+          </label>
+          <p class="toggle-hint">Unloads the model if memory pressure gets critical (Ollama stays running)</p>
+          <label class="toggle-row">
+            <input type="checkbox" id="auto-unload-idle" />
+            <span>Auto-free RAM after 10 min idle</span>
+          </label>
+          <p class="toggle-hint">Unloads the model after 5 min idle on 8 GB Macs, 10 min otherwise</p>
         </div>
       </details>
       </div>
       <div class="sidebar-footer">
+        <div id="resource-panel" class="resource-panel">
+          <div class="resource-row">
+            <span class="resource-label">RAM</span>
+            <div class="resource-bar" title="System memory use">
+              <div id="ram-bar-fill" class="resource-bar-fill"></div>
+            </div>
+            <span id="ram-pct" class="resource-pct">—</span>
+          </div>
+          <div id="resource-model" class="resource-model">Checking memory…</div>
+          <button type="button" id="free-ram-btn" class="btn-free-ram hidden" title="Unload Ollama models from RAM (Ollama keeps running)">
+            Free model RAM
+          </button>
+          <p id="resource-warn" class="resource-warn hidden"></p>
+        </div>
         <div class="status-row">
           <span id="status-dot" class="status-dot"></span>
           <span id="status-text">Connecting…</span>
@@ -70,7 +99,7 @@
         <button type="button" id="stop-btn" class="btn-stop" title="Stop or start chat worker">
           Stop server
         </button>
-        <p id="footer-hint" class="footer-hint">Stop frees model RAM · this page stays open</p>
+        <p id="footer-hint" class="footer-hint">Stop unloads model RAM · Ollama app keeps running</p>
       </div>
     </aside>
 
@@ -119,7 +148,7 @@
         </div>
         <div class="composer-inner">
           <input type="file" id="file-input" multiple hidden />
-          <button type="button" id="attach-btn" class="composer-attach" title="Attach file" aria-label="Attach file">
+          <button type="button" id="attach-btn" class="composer-attach" title="Attach file or paste screenshot (⌘V)" aria-label="Attach file">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
             </svg>
@@ -139,6 +168,7 @@
             </svg>
           </button>
         </div>
+        <div id="composer-status" class="composer-status hidden" role="status" aria-live="polite"></div>
         <p class="composer-hint" id="mode-hint">Ask mode — plain chat · Set project folder for Agent/Plan/Debug</p>
       </form>
     </main>

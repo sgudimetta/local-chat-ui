@@ -84,14 +84,26 @@ ESPN_LEAGUES = (
     {"pattern": re.compile(r"(?i)\b(nba|basketball)\b"), "sport": "basketball", "league": "nba", "label": "NBA"},
     {"pattern": re.compile(r"(?i)\b(mlb|baseball)\b"), "sport": "baseball", "league": "mlb", "label": "MLB"},
     {"pattern": re.compile(r"(?i)\b(premier\s*league|epl|english\s+premier)\b"), "sport": "soccer", "league": "eng.1", "label": "Premier League"},
+    {"pattern": re.compile(r"(?i)\b(ipl|indian premier league)\b"), "sport": "cricket", "league": "8048", "label": "IPL"},
     {"pattern": re.compile(r"(?i)\b(college\s*football|ncaa\s*football|cfb)\b"), "sport": "football", "league": "college-football", "label": "College Football"},
 )
 
 SPORTS_LIVE_PATTERN = re.compile(
     r"(?i)\b("
     r"next|upcoming|schedule|fixture|when|where|today|tonight|live|score|scores|"
-    r"who won|kickoff|kick off|game|match|race|grand\s*prix"
+    r"who won|kickoff|kick off|game|match|race|grand\s*prix|"
+    r"series|tour|playing|ongoing|current"
     r")\b"
+)
+
+TEMPORAL_QUERY_PATTERN = re.compile(
+    r"(?i)\b(current|ongoing|latest|today|now|this week|this month|right now|"
+    r"upcoming|next|schedule|who won|playing|score|standings|tour|series)\b"
+)
+
+QUESTION_PREFIX = re.compile(
+    r"(?i)^(?:what(?:'s| is)|who(?:'s| is)|when(?:'s| is)|where(?:'s| is)|"
+    r"how many|how much|tell me about|is there|are there)\s+"
 )
 
 TIME_PATTERN = re.compile(
@@ -144,6 +156,8 @@ LIVE_REQUIRED_PATTERN = re.compile(
     r"\b(next\s+(?:game|match|fixture|race|grand\s*prix)|upcoming\s+(?:game|match|race))\b|"
     r"\b(f1|formula\s*one|formula\s*1|grand\s*prix)\b.*\b(next|schedule|when|where|today|live|race)\b|"
     r"\b(world\s*cup|worldcup|fifa|nfl|nba|mlb)\b.*\b(next|schedule|score|today|live)\b|"
+    r"\b(cricket|ipl|t20|odi)\b.*\b(series|tour|schedule|current|ongoing|playing|match)\b|"
+    r"\b(india|indian|team india)\b.*\b(cricket|series|tour|schedule|playing)\b|"
     r"\b(look up online|search the web|search online|find online|check online)\b"
 )
 
@@ -154,7 +168,10 @@ VERIFY_FACTS_PATTERN = re.compile(
     r"kotlin|swift|react|angular|vue|spring|\.net|dotnet|ubuntu|debian|macos|ios|android|"
     r"chrome|firefox|safari|windows|llama|ollama|gpt|claude|gemini"
     r")\b|"
-    r"\b(what|which)\s+(?:is\s+)?(?:the\s+)?(?:latest|current|newest)\b|"
+    r"\b(what|which)\s+(?:is\s+)?(?:the\s+)?(?:latest|current|newest)\b.{0,35}\b("
+    r"version|release|jdk|java|python|node|typescript|golang|rust|kotlin|swift|react|angular|"
+    r"ubuntu|debian|macos|ios|android|chrome|firefox|windows|llama|ollama|gpt|claude|gemini"
+    r")\b|"
     r"\bwhen\s+(?:was|is)\s+.+\b(?:released|launched|announced|general availability|ga)\b|"
     r"\b(?:is|are)\s+.+\b(?:still\s+supported|end[- ]of[- ]life|eol)\b|"
     r"\b(?:release\s+date|ga\s+date)\s+of\b"
@@ -217,13 +234,16 @@ def _fetch_json(url: str, timeout: int = 12) -> dict:
     except urllib.error.URLError as e:
         if "SSL" not in str(e) and "certificate" not in str(e).lower():
             raise
-        proc = subprocess.run(
-            ["curl", "-sf", "--max-time", str(timeout), "-A", USER_AGENT, url],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return json.loads(proc.stdout)
+        try:
+            proc = subprocess.run(
+                ["curl", "-sf", "--max-time", str(timeout), "-A", USER_AGENT, url],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(proc.stdout)
+        except (subprocess.CalledProcessError, ValueError, json.JSONDecodeError) as err:
+            raise urllib.error.URLError(str(err)) from err
 
 
 def _fetch_text(url: str, timeout: int = 12) -> str:
@@ -297,31 +317,42 @@ def format_fx_answer(fx: dict) -> str:
     )
 
 
-def search_duckduckgo(query: str, max_results: int = 8) -> list[dict]:
-    url = f"https://lite.duckduckgo.com/lite/?q={quote(query)}"
-    html = unescape(_fetch_text(url, timeout=15))
-    rows = html.split("<tr")
-    results: list[dict] = []
-    i = 0
-    while i < len(rows) - 2 and len(results) < max_results:
-        chunk = rows[i]
-        if 'rel="nofollow"' not in chunk:
-            i += 1
-            continue
-        link_m = re.search(r'rel="nofollow" href="([^"]+)"[^>]*>([^<]+)', chunk)
-        if not link_m:
-            i += 1
-            continue
-        title = re.sub(r"\s+", " ", link_m.group(2)).strip()
-        href = link_m.group(1)
-        snippet = ""
-        if i + 1 < len(rows):
-            snippet_raw = re.sub(r"<[^>]+>", " ", rows[i + 1])
-            snippet = re.sub(r"\s+", " ", snippet_raw).strip()
-        if title and not title.startswith("Next"):
-            results.append({"title": title, "snippet": snippet[:400], "url": href})
-        i += 1
-    return results
+def search_duckduckgo(query: str, max_results: int = 8, *, retries: int = 2) -> list[dict]:
+    last_err: urllib.error.URLError | None = None
+    for attempt in range(retries):
+        try:
+            url = f"https://lite.duckduckgo.com/lite/?q={quote(query)}"
+            html = unescape(_fetch_text(url, timeout=15))
+            rows = html.split("<tr")
+            results: list[dict] = []
+            i = 0
+            while i < len(rows) - 2 and len(results) < max_results:
+                chunk = rows[i]
+                if 'rel="nofollow"' not in chunk:
+                    i += 1
+                    continue
+                link_m = re.search(r'rel="nofollow" href="([^"]+)"[^>]*>([^<]+)', chunk)
+                if not link_m:
+                    i += 1
+                    continue
+                title = re.sub(r"\s+", " ", link_m.group(2)).strip()
+                href = link_m.group(1)
+                snippet = ""
+                if i + 1 < len(rows):
+                    snippet_raw = re.sub(r"<[^>]+>", " ", rows[i + 1])
+                    snippet = re.sub(r"\s+", " ", snippet_raw).strip()
+                if title and not title.startswith("Next"):
+                    results.append({"title": title, "snippet": snippet[:400], "url": href})
+                i += 1
+            if results:
+                return results
+        except urllib.error.URLError as e:
+            last_err = e
+            if attempt + 1 < retries:
+                time.sleep(0.4 * (attempt + 1))
+    if last_err:
+        raise last_err
+    return []
 
 
 def search_ddg_instant(query: str) -> dict | None:
@@ -390,20 +421,255 @@ def extract_facts_from_results(results: list[dict]) -> list[str]:
 
 
 def refine_search_query(query: str) -> str:
-    if query_needs_verification(query):
-        year = date.today().year
-        return f"{query.strip()} latest official release date {year}"
-    if re.search(r"(?i)\b(f1|formula\s*one|formula\s*1|grand\s*prix)\b", query):
-        return f"Formula 1 next race schedule {date.today().year} {query.strip()}"
-    if re.search(r"(?i)\b(world\s*cup|worldcup|fifa)\b", query) and re.search(
-        r"(?i)\b(next|upcoming|schedule|fixture|when|where|match|game)\b", query
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip().rstrip("?").strip()
+    year = date.today().year
+    month = date.today().strftime("%B")
+
+    if query_needs_verification(q):
+        return f"{q} latest official release date {year}"
+
+    if TEMPORAL_QUERY_PATTERN.search(q):
+        if str(year) not in q:
+            return f"{q} {month} {year}"
+        return f"{q} {month}"
+
+    return q
+
+
+FILLER_WORDS = re.compile(
+    r"(?i)\b(the|a|an|current|ongoing|latest|recent|present|right now|"
+    r"what|is|are|was|were|that|this|please|tell me|about|which|who|when|where|how)\b"
+)
+
+
+def _search_terms_from_query(query: str) -> str:
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip().rstrip("?").strip()
+    q = QUESTION_PREFIX.sub("", q).strip()
+    q = FILLER_WORDS.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    if TEMPORAL_QUERY_PATTERN.search(query) and str(date.today().year) not in q:
+        q = f"{q} {date.today().year}"
+    return q[:160] if q else query[:160]
+
+
+def _wiki_hit_score(extract: str, query: str, title: str = "") -> int:
+    score = 0
+    years = _years_in_text(extract)
+    cy = date.today().year
+    if years:
+        max_y = max(years)
+        if max_y >= cy:
+            score += 30
+        elif max_y >= cy - 1:
+            score += 15
+        elif max_y < cy - 2:
+            score -= 20
+    if TEMPORAL_QUERY_PATTERN.search(query):
+        if re.search(rf"(?i)\b{cy}\b", extract):
+            score += 25
+        if re.search(r"(?i)\b(tour|series|schedule|fixture|match|playing|vs\.?|versus)\b", extract):
+            score += 10
+    keywords = [w for w in _search_terms_from_query(query).lower().split() if len(w) > 3 and not w.isdigit()]
+    blob = f"{title} {extract}".lower()
+    score += sum(5 for k in keywords if k in blob)
+    if re.search(r"(?i)\bwho won\b", query) and not re.search(
+        r"(?i)\b(won|winner|victory|champion|defeated|beat)\b", extract[:500]
     ):
-        return f"FIFA World Cup next match schedule venue 2026 {query}"
-    if re.search(r"(?i)\b(next|upcoming|schedule|fixture)\b", query) and re.search(
-        r"(?i)\b(match|game|playoff|final|tournament|vs\.?)\b", query
-    ):
-        return f"{query} schedule date time venue"
-    return query
+        score -= 25
+    return score
+
+
+def _years_in_text(text: str) -> list[int]:
+    return [int(y) for y in re.findall(r"\b(20\d{2})\b", text or "")]
+
+
+def _is_stale_reference(text: str, query: str) -> bool:
+    """Drop references that only mention years far in the past for 'current/latest' questions."""
+    if not TEMPORAL_QUERY_PATTERN.search(query):
+        return False
+    years = _years_in_text(text)
+    if not years:
+        return False
+    return max(years) < date.today().year - 1
+
+
+def _trim_extract(extract: str, max_len: int = 950) -> str:
+    text = extract.strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rsplit(" ", 1)[0] + "…"
+
+
+def _wikipedia_search_hits(query: str, *, limit: int = 3) -> list[tuple[str, str, str]]:
+    """Search Wikipedia by terms extracted from the question — never use the raw question as a page title."""
+    terms = _search_terms_from_query(query)
+    search_url = (
+        "https://en.wikipedia.org/w/api.php"
+        f"?action=query&list=search&srsearch={quote(terms)}&format=json&srlimit={limit + 2}"
+    )
+    try:
+        search = _fetch_json(search_url)
+    except (urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return []
+    ranked: list[tuple[int, str, str, str]] = []
+    for hit in search.get("query", {}).get("search") or []:
+        title = hit.get("title")
+        if not title:
+            continue
+        try:
+            result = _wikipedia_extract(title)
+        except (urllib.error.URLError, ValueError, KeyError):
+            continue
+        if not result:
+            continue
+        extract, wiki_url = result
+        if _is_stale_reference(extract, query):
+            continue
+        ranked.append((_wiki_hit_score(extract, query, title), title, extract, wiki_url))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [(t, e, u) for _s, t, e, u in ranked[:limit]]
+
+
+def _rank_ddg_results(results: list[dict], query: str) -> list[dict]:
+    def score(r: dict) -> int:
+        text = f"{r.get('title', '')} {r.get('snippet', '')}"
+        s = _wiki_hit_score(text, query, r.get("title", ""))
+        if _is_stale_reference(text, query):
+            s -= 50
+        return s
+
+    return sorted(results, key=score, reverse=True)
+
+
+def build_direct_from_research(
+    query: str,
+    instant: dict | None,
+    wiki_hits: list[tuple[str, str, str]],
+    ddg_results: list[dict],
+) -> str | None:
+    """Build a direct answer from web sources — bypasses the local LLM for factual lookups."""
+    sections: list[str] = []
+
+    if instant and instant.get("snippet") and not _is_stale_reference(instant["snippet"], query):
+        sections.append(f"**{instant['title']}**\n\n{instant['snippet']}")
+
+    for title, extract, _url in wiki_hits:
+        wscore = _wiki_hit_score(extract, query, title)
+        if wscore < 15 and ddg_results:
+            continue
+        if re.search(r"(?i)\bwho won\b", query) and wscore < 25:
+            continue
+        sections.append(f"**{title}** (Wikipedia)\n\n{_trim_extract(extract, 850)}")
+        break
+
+    fresh_ddg = [
+        r
+        for r in ddg_results
+        if r.get("snippet")
+        and not _is_stale_reference(f"{r.get('title', '')} {r.get('snippet', '')}", query)
+    ]
+    pool = fresh_ddg if fresh_ddg else ddg_results
+
+    if not sections and pool:
+        lines = [f"**From web search** ({date.today().strftime('%B %d, %Y')})", ""]
+        for r in pool[:4]:
+            title = (r.get("title") or "").strip()
+            snippet = (r.get("snippet") or "").strip()
+            if title and snippet:
+                lines.extend([f"**{title}**", snippet[:420], ""])
+        if len(lines) > 2:
+            sections.append("\n".join(lines).strip())
+    elif pool and len(sections) == 1:
+        r = pool[0]
+        snippet = (r.get("snippet") or "").strip()
+        if snippet:
+            sections.append(f"**Also:** {(r.get('title') or 'Source')}\n{snippet[:380]}")
+
+    return "\n\n".join(sections) if sections else None
+
+
+def _is_factual_lookup(query: str) -> bool:
+    if LOCAL_ONLY_PATTERN.search(query) and not FACTUAL_QUERY_PATTERN.search(query):
+        return False
+    return bool(
+        FACTUAL_QUERY_PATTERN.search(query)
+        or LIVE_REQUIRED_PATTERN.search(query)
+        or TEMPORAL_QUERY_PATTERN.search(query)
+    )
+
+
+def run_web_research(query: str) -> tuple[HandlerResult, list[dict]]:
+    """Generic web lookup: DDG Instant + Wikipedia search + DDG scrape → direct or LLM context."""
+    search_q = refine_search_query(query)
+    sources: list[dict] = []
+    instant: dict | None = None
+
+    try:
+        instant = search_ddg_instant(search_q) or search_ddg_instant(query)
+        if instant:
+            sources.append(
+                {"title": instant["title"], "snippet": instant["snippet"], "url": instant["url"]}
+            )
+    except (urllib.error.URLError, ValueError, json.JSONDecodeError):
+        pass
+
+    wiki_hits: list[tuple[str, str, str]] = []
+    if not re.search(r"(?i)\bwho won\b", query):
+        try:
+            wiki_hits = _wikipedia_search_hits(query, limit=2)
+        except Exception:
+            wiki_hits = []
+
+    ddg_results: list[dict] = []
+    try:
+        ddg_results = _rank_ddg_results(search_duckduckgo(search_q, max_results=8), query)
+    except urllib.error.URLError:
+        pass
+
+    seen_urls: set[str] = {s.get("url", "") for s in sources}
+    for r in ddg_results:
+        url = r.get("url", "")
+        if url and url not in seen_urls:
+            sources.append(r)
+            seen_urls.add(url)
+
+    for title, extract, url in wiki_hits:
+        sources.append(
+            {"title": f"Wikipedia · {title}", "snippet": extract[:300], "url": url}
+        )
+
+    direct = build_direct_from_research(query, instant, wiki_hits, ddg_results)
+    blocks: list[str] = []
+    if instant:
+        blocks.append(f"DuckDuckGo Instant:\n{instant['title']}\n{instant['snippet']}")
+    for title, extract, _url in wiki_hits:
+        blocks.append(f"Wikipedia — {title}:\n{_trim_extract(extract)}")
+
+    if direct and _is_factual_lookup(query):
+        return (
+            HandlerResult(
+                direct_answer=direct,
+                context_blocks=[direct],
+                sources=sources,
+                handler="web",
+                source_label="Web search",
+                live_data=True,
+                use_direct=True,
+            ),
+            ddg_results,
+        )
+
+    return (
+        HandlerResult(
+            context_blocks=blocks,
+            sources=sources,
+            handler="web",
+            source_label="Web search",
+            live_data=bool(blocks or ddg_results),
+            use_direct=False,
+        ),
+        ddg_results,
+    )
 
 
 # --- Handlers ---
@@ -906,74 +1172,17 @@ def _wikipedia_extract(title: str) -> tuple[str, str] | None:
     return _wikipedia_extract(hits[0]["title"])
 
 
-def handle_wikipedia(query: str) -> HandlerResult | None:
-    m = WIKI_PATTERN.match(query.strip())
-    if not m:
-        return None
-    topic = m.group(1).strip(" ?.")
-    if len(topic) < 2 or re.search(r"(?i)\b(draft|write|email|explain|code|function)\b", topic):
-        return None
-    try:
-        result = _wikipedia_extract(topic)
-    except (urllib.error.URLError, ValueError, KeyError):
-        return None
-    if not result:
-        return None
-    extract, wiki_url = result
-    snippet = extract if len(extract) <= 900 else extract[:900].rsplit(" ", 1)[0] + "…"
-    answer = f"**{topic.title()}** (via Wikipedia):\n\n{snippet}"
-    return HandlerResult(
-        direct_answer=None,
-        context_blocks=[f"Wikipedia reference for {topic.title()}:\n{snippet}"],
-        sources=[{"title": f"Wikipedia · {topic.title()}", "snippet": snippet[:300], "url": wiki_url}],
-        handler="wikipedia",
-        source_label="Wikipedia",
-        live_data=False,
-        use_direct=False,
-    )
-
-
-def handle_ddg_instant(query: str) -> HandlerResult | None:
-    if WIKI_PATTERN.match(query.strip()):
-        return None
-    if re.search(r"(?i)\b(draft|write|code|implement|refactor|debug)\b", query):
-        return None
-    if not re.search(r"(?i)^(who|what|when|where|how many|how much|is|are|tell me)\b", query.strip()):
-        if not FACTUAL_QUERY_PATTERN.search(query):
-            return None
-    hit = search_ddg_instant(query)
-    if not hit:
-        return None
-    answer = f"**{hit['title']}**\n\n{hit['snippet']}"
-    return HandlerResult(
-        direct_answer=None,
-        context_blocks=[f"Reference:\n{answer}"],
-        sources=[{"title": hit["title"], "snippet": hit["snippet"], "url": hit["url"]}],
-        handler="ddg_instant",
-        source_label="DuckDuckGo Instant Answer",
-        live_data=False,
-        use_direct=False,
-    )
-
-
-HANDLERS: list[tuple[str, object]] = [
+API_HANDLERS: list[tuple[str, object]] = [
     ("time", handle_time),
     ("fx", handle_fx),
     ("crypto", handle_crypto),
     ("weather", handle_weather),
-    ("espn", handle_espn_sports),
-]
-
-REFERENCE_HANDLERS: list[tuple[str, object]] = [
-    ("wikipedia", handle_wikipedia),
-    ("ddg_instant", handle_ddg_instant),
 ]
 
 
-def run_handlers(query: str, *, include_reference: bool = False) -> HandlerResult:
+def run_api_handlers(query: str) -> HandlerResult:
     merged = HandlerResult()
-    handlers = HANDLERS + (REFERENCE_HANDLERS if include_reference else [])
-    for _name, handler in handlers:
+    for _name, handler in API_HANDLERS:
         try:
             result = handler(query)
         except Exception:
@@ -995,10 +1204,22 @@ def run_handlers(query: str, *, include_reference: bool = False) -> HandlerResul
     return merged
 
 
+def _pack_direct_result(handler_out: HandlerResult, now_line: str) -> dict:
+    context = f"{now_line}\n\n{handler_out.direct_answer}"
+    return {
+        "context": context,
+        "direct_answer": handler_out.direct_answer,
+        "sources": handler_out.sources,
+        "handler": handler_out.handler,
+        "source_label": handler_out.source_label,
+        "live_data": handler_out.live_data,
+    }
+
+
 def build_web_context(query: str, *, force_search: bool = False) -> dict:
     """
     Returns dict with: context, direct_answer, sources, handler, source_label, live_data.
-    Direct answers only for truly live data (FX, weather, sports, etc.).
+    Live APIs (time/FX/crypto/weather) + generic web research for everything else.
     """
     cache_key = f"{force_search}|{query.strip().lower()}"
     cached = _cache_get(cache_key)
@@ -1007,10 +1228,8 @@ def build_web_context(query: str, *, force_search: bool = False) -> dict:
 
     now_line = _now_line()
     needs_verify = query_needs_verification(query)
-    include_reference = True
-    handler_out = run_handlers(query, include_reference=include_reference)
+    handler_out = run_api_handlers(query)
 
-    fx_block = ""
     pair = detect_fx_pair(query)
     if pair and not any("Live exchange rate" in b for b in handler_out.context_blocks):
         try:
@@ -1029,56 +1248,62 @@ def build_web_context(query: str, *, force_search: bool = False) -> dict:
         except (urllib.error.URLError, ValueError, KeyError):
             pass
 
-    results: list[dict] = []
-    has_direct = bool(handler_out.direct_answer and handler_out.use_direct)
-    run_scrape = force_search or needs_verify or not has_direct
-    if run_scrape:
-        search_query = refine_search_query(query)
-        try:
-            results = search_duckduckgo(search_query, max_results=8)
-            handler_out.sources.extend(results)
-        except urllib.error.URLError as e:
-            if not handler_out.context_blocks and not handler_out.direct_answer:
-                out = {
-                    "context": f"Web search failed: {e}",
-                    "direct_answer": None,
-                    "sources": handler_out.sources,
-                    "handler": handler_out.handler,
-                    "source_label": handler_out.source_label,
-                    "live_data": handler_out.live_data,
-                }
-                return out
+    if handler_out.use_direct and handler_out.direct_answer:
+        out = _pack_direct_result(handler_out, now_line)
+        _cache_set(cache_key, out)
+        return out
 
-    extracted = extract_facts_from_results(results) if results else []
-    lines = [now_line, ""]
-    if handler_out.direct_answer and handler_out.use_direct:
-        context = f"{now_line}\n\n{handler_out.direct_answer}"
+    try:
+        web, ddg_results = run_web_research(query)
+    except Exception:
+        web, ddg_results = HandlerResult(), []
+
+    handler_out.sources.extend(web.sources)
+    handler_out.context_blocks.extend(web.context_blocks)
+    if web.use_direct and web.direct_answer:
+        handler_out.direct_answer = web.direct_answer
+        handler_out.use_direct = True
+        handler_out.handler = web.handler or "web"
+        handler_out.source_label = web.source_label or "Web search"
+        handler_out.live_data = True
+
+    if handler_out.use_direct and handler_out.direct_answer:
+        out = _pack_direct_result(handler_out, now_line)
+        _cache_set(cache_key, out)
+        return out
+
+    if not handler_out.context_blocks and not ddg_results:
         out = {
-            "context": context,
-            "direct_answer": handler_out.direct_answer,
+            "context": f"{now_line}\n\nNo web results found for this query.",
+            "direct_answer": None,
             "sources": handler_out.sources,
             "handler": handler_out.handler,
             "source_label": handler_out.source_label,
-            "live_data": handler_out.live_data,
+            "live_data": False,
         }
         _cache_set(cache_key, out)
         return out
 
-    lines.append("Reference material (use for facts only — reason and synthesize in your own words):")
+    extracted = extract_facts_from_results(ddg_results) if ddg_results else []
+    lines = [now_line, ""]
+    lines.append(
+        "WEB SEARCH RESULTS — answer using ONLY this material. "
+        f"Today is {date.today().strftime('%B %d, %Y')}. "
+        "Ignore training-data dates (e.g. 2023) unless they appear in these sources."
+    )
     if needs_verify:
         lines.append(
-            "VERIFICATION REQUIRED: version numbers, release dates, and 'latest/current' claims "
-            "must come from these sources — not from model memory."
+            "VERIFICATION MODE: version/release claims must come from these sources only."
         )
     lines.append("")
     for block in handler_out.context_blocks:
         lines.extend([block, ""])
     if extracted:
-        lines.append("Extracted facts from search snippets:")
+        lines.append("Key facts from snippets:")
         lines.extend(extracted)
         lines.append("")
-    for n, r in enumerate(results, 1):
-        lines.append(f"{n}. {r['title']}")
+    for n, r in enumerate(ddg_results, 1):
+        lines.append(f"{n}. {r.get('title', '')}")
         if r.get("snippet"):
             lines.append(f"   {r['snippet']}")
 
@@ -1087,9 +1312,9 @@ def build_web_context(query: str, *, force_search: bool = False) -> dict:
         "context": context,
         "direct_answer": None,
         "sources": handler_out.sources,
-        "handler": handler_out.handler,
-        "source_label": handler_out.source_label,
-        "live_data": handler_out.live_data,
+        "handler": handler_out.handler or "web",
+        "source_label": handler_out.source_label or "Web search",
+        "live_data": bool(handler_out.context_blocks or ddg_results),
         "verify_facts": needs_verify,
     }
     _cache_set(cache_key, out)

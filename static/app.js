@@ -32,6 +32,15 @@ const writeRejectBtn = document.getElementById("write-reject");
 const attachBtn = document.getElementById("attach-btn");
 const fastModeToggle = document.getElementById("fast-mode");
 const unloadOnCloseToggle = document.getElementById("unload-on-close");
+const lowRamModeToggle = document.getElementById("low-ram-mode");
+const autoUnloadPressureToggle = document.getElementById("auto-unload-pressure");
+const autoUnloadIdleToggle = document.getElementById("auto-unload-idle");
+const ramBarFill = document.getElementById("ram-bar-fill");
+const ramPctEl = document.getElementById("ram-pct");
+const resourceModelEl = document.getElementById("resource-model");
+const resourceWarnEl = document.getElementById("resource-warn");
+const freeRamBtn = document.getElementById("free-ram-btn");
+const composerStatusEl = document.getElementById("composer-status");
 
 const CHAT_MODES = {
   agent: {
@@ -58,7 +67,7 @@ const CHAT_MODES = {
   ask: {
     label: "Ask",
     icon: "💬",
-    hint: "Plain chat · attach files or images to analyze",
+    hint: "Plain chat · attach or ⌘V paste screenshots to analyze",
     needsRepo: false,
     activity: "Thinking through your question",
   },
@@ -78,6 +87,9 @@ const DEFAULTS = {
   webSearch: true,
   fastMode: false,
   unloadOnClose: true,
+  lowRamMode: false,
+  autoUnloadOnPressure: true,
+  autoUnloadIdle: false,
   chatMode: "ask",
   repoPath: "",
 };
@@ -270,6 +282,11 @@ function loadSettings() {
     webSearchToggle.checked = saved.webSearch ?? DEFAULTS.webSearch;
     fastModeToggle.checked = saved.fastMode ?? DEFAULTS.fastMode;
     unloadOnCloseToggle.checked = saved.unloadOnClose ?? DEFAULTS.unloadOnClose;
+    if (lowRamModeToggle) lowRamModeToggle.checked = saved.lowRamMode ?? DEFAULTS.lowRamMode;
+    if (autoUnloadPressureToggle) {
+      autoUnloadPressureToggle.checked = saved.autoUnloadOnPressure ?? DEFAULTS.autoUnloadOnPressure;
+    }
+    if (autoUnloadIdleToggle) autoUnloadIdleToggle.checked = saved.autoUnloadIdle ?? DEFAULTS.autoUnloadIdle;
     if (saved.chatMode) setChatMode(saved.chatMode);
     if (repoPathInput && saved.repoPath) repoPathInput.value = saved.repoPath;
     const panel = document.getElementById("settings-panel");
@@ -282,6 +299,9 @@ function loadSettings() {
     webSearchToggle.checked = DEFAULTS.webSearch;
     fastModeToggle.checked = DEFAULTS.fastMode;
     unloadOnCloseToggle.checked = DEFAULTS.unloadOnClose;
+    if (lowRamModeToggle) lowRamModeToggle.checked = DEFAULTS.lowRamMode;
+    if (autoUnloadPressureToggle) autoUnloadPressureToggle.checked = DEFAULTS.autoUnloadOnPressure;
+    if (autoUnloadIdleToggle) autoUnloadIdleToggle.checked = DEFAULTS.autoUnloadIdle;
   }
 }
 
@@ -292,6 +312,9 @@ function saveSettings() {
       webSearch: webSearchToggle.checked,
       fastMode: fastModeToggle.checked,
       unloadOnClose: unloadOnCloseToggle.checked,
+      lowRamMode: lowRamModeToggle?.checked ?? false,
+      autoUnloadOnPressure: autoUnloadPressureToggle?.checked ?? true,
+      autoUnloadIdle: autoUnloadIdleToggle?.checked ?? false,
       chatMode,
       repoPath: repoPathInput?.value?.trim() || "",
       optionsOpen: document.getElementById("settings-panel")?.open ?? false,
@@ -755,7 +778,13 @@ function needsFactVerification(text) {
   ) {
     return true;
   }
-  if (/\b(what|which)\s+(?:is\s+)?(?:the\s+)?(?:latest|current|newest)\b/i.test(t)) return true;
+  if (
+    /\b(what|which)\s+(?:is\s+)?(?:the\s+)?(?:latest|current|newest)\b.{0,35}\b(version|release|jdk|java|python|node|typescript|golang|rust|kotlin|swift|react|angular|ubuntu|debian|macos|ios|android|chrome|firefox|windows|ollama|llama|gpt|claude|gemini)\b/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
   if (/\bwhen\s+(?:was|is)\s+.+\b(?:released|launched|announced|general availability|ga)\b/i.test(t)) {
     return true;
   }
@@ -1041,6 +1070,26 @@ async function addAttachmentFile(file) {
   renderAttachmentPreview();
 }
 
+async function handleComposerPaste(e) {
+  if (userInput?.disabled || attachBtn?.disabled) return;
+  const cd = e.clipboardData;
+  if (!cd?.items?.length) return;
+
+  const imageItems = [...cd.items].filter((item) => item.type.startsWith("image/"));
+  if (!imageItems.length) return;
+
+  e.preventDefault();
+  for (const item of imageItems) {
+    const blob = item.getAsFile();
+    if (!blob) continue;
+    const ext = (item.type.split("/")[1] || "png").replace("jpeg", "jpg");
+    const name = `screenshot-${Date.now()}.${ext}`;
+    const file = new File([blob], name, { type: blob.type || item.type });
+    await addAttachmentFile(file);
+  }
+  userInput?.focus();
+}
+
 function showWriteApproval(proposal) {
   return new Promise((resolve) => {
     if (!writeApprovalEl) {
@@ -1175,8 +1224,11 @@ async function runAgent(chat, userText) {
   } finally {
     streaming = false;
     streamAbort = null;
+    streamStartedAt = 0;
+    lastStreamActivityAt = 0;
     setComposerStreaming(false);
     userInput.focus();
+    refreshComposerState();
   }
 }
 
@@ -1259,6 +1311,37 @@ function applySystemPrompt(chat, text) {
 }
 
 function pickBestModel(models, ramGb = systemRamGb) {
+  const tier = memoryTier(ramGb);
+  const safeForTiny = models.filter((m) => isLightModel(m));
+  const safeForLow = models.filter((m) => !isHeavyModel(m) && !isMediumModel(m));
+
+  if (tier === "tiny" && safeForTiny.length) {
+    const prefer = [
+      (m) => /llama3\.2:1b|llama3\.2:3b/.test(m),
+      (m) => /llama3\.1:8b|llama3:8b/.test(m),
+      (m) => /1b|3b/.test(m),
+      (m) => /8b|7b/.test(m),
+    ];
+    for (const test of prefer) {
+      const match = safeForTiny.find(test);
+      if (match) return match;
+    }
+    return safeForTiny[0];
+  }
+
+  if (tier === "low" && safeForLow.length) {
+    const prefer = [
+      (m) => /llama3\.1:8b|llama3:8b/.test(m),
+      (m) => /llama3\.2:1b|llama3\.2:3b/.test(m),
+      (m) => /8b|7b/.test(m),
+    ];
+    for (const test of prefer) {
+      const match = safeForLow.find(test);
+      if (match) return match;
+    }
+    return safeForLow[0];
+  }
+
   const has32 = (m) => /32b|70b/.test(m);
   const has14 = (m) => /14b/.test(m);
   const has8 = (m) => /8b/.test(m);
@@ -1300,10 +1383,25 @@ function pickBestModel(models, ramGb = systemRamGb) {
 function updateModelHint(models) {
   if (!modelHintEl) return;
   const ram = systemRamGb;
-  const has32 = models.some((m) => /32b|70b/.test(m));
+  const tier = memoryTier(ram);
   const selected = modelSelect?.value || "";
-  const is32 = /32b|70b/.test(selected);
+  const is32 = isHeavyModel(selected);
+  const is14 = isMediumModel(selected);
 
+  if (tier === "tiny") {
+    if (is32 || is14) {
+      modelHintEl.textContent = `⚠ ${ram} GB RAM — ${selected} is too large. Use llama3.2:1b or llama3.1:8b`;
+    } else {
+      modelHintEl.textContent = `${ram} GB RAM — keep Low RAM mode on; Stop server when using Cursor heavily`;
+    }
+    return;
+  }
+  if (tier === "low" && (is32 || is14)) {
+    modelHintEl.textContent = `⚠ ${ram} GB RAM — ${selected} may choke the system; prefer 8B models`;
+    return;
+  }
+
+  const has32 = models.some((m) => isHeavyModel(m));
   if (has32 && is32) {
     modelHintEl.textContent = ram
       ? `${ram} GB RAM detected — great fit for ${selected}`
@@ -1318,6 +1416,10 @@ function updateModelHint(models) {
     modelHintEl.textContent = "More RAM? Try: ollama pull qwen3:14b";
     return;
   }
+  if (tier === "low") {
+    modelHintEl.textContent = `${ram} GB RAM — Low RAM mode recommended with 8B models`;
+    return;
+  }
   modelHintEl.textContent = "";
 }
 
@@ -1328,13 +1430,209 @@ async function warmModel() {
     await fetch("/api/warmup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, fast_mode: fastModeToggle?.checked ?? false }),
+      body: JSON.stringify({ model, fast_mode: fastModeToggle?.checked ?? false, low_ram_mode: lowRamModeToggle?.checked ?? false, ram_tier: memoryTier() }),
     });
   } catch {
     /* non-fatal */
   }
 }
 
+let lastChatActivity = Date.now();
+let lastAutoUnloadAt = 0;
+let resourcePollTimer = null;
+let systemSnapshot = null;
+let streamStartedAt = 0;
+let lastStreamActivityAt = 0;
+let composerBlockedSince = 0;
+let healInProgress = false;
+let healthWatchdogTimer = null;
+let lastHealAt = 0;
+
+const IDLE_UNLOAD_MS = 10 * 60 * 1000;
+const IDLE_UNLOAD_MS_TINY = 5 * 60 * 1000;
+const AUTO_UNLOAD_COOLDOWN_MS = 3 * 60 * 1000;
+const STREAM_STALL_MS = 2 * 60 * 1000;
+const STREAM_STALL_MS_TINY = 90 * 1000;
+const STREAM_MAX_MS = 12 * 60 * 1000;
+const STREAM_MAX_MS_TINY = 8 * 60 * 1000;
+const COMPOSER_STUCK_MS = 25 * 1000;
+const HEAL_COOLDOWN_MS = 45 * 1000;
+
+function memoryTier(ramGb = systemRamGb) {
+  if (ramGb == null) return "normal";
+  if (ramGb <= 8) return "tiny";
+  if (ramGb <= 16) return "low";
+  return "normal";
+}
+
+function idleUnloadMs() {
+  return memoryTier() === "tiny" ? IDLE_UNLOAD_MS_TINY : IDLE_UNLOAD_MS;
+}
+
+function streamStallMs() {
+  return memoryTier() === "tiny" ? STREAM_STALL_MS_TINY : STREAM_STALL_MS;
+}
+
+function streamMaxMs() {
+  return memoryTier() === "tiny" ? STREAM_MAX_MS_TINY : STREAM_MAX_MS;
+}
+
+function isHeavyModel(name) {
+  return /32b|70b|34b|405b/i.test(name || "");
+}
+
+function isMediumModel(name) {
+  return /14b|13b|22b/i.test(name || "");
+}
+
+function isLightModel(name) {
+  return /1b|3b|7b|8b/i.test(name || "") && !isHeavyModel(name) && !isMediumModel(name);
+}
+
+function applyRamTierDefaults(ramGb) {
+  if (!ramGb) return;
+  const tier = memoryTier(ramGb);
+  const key = `ramTierDefaults_${tier}`;
+  if (localStorage.getItem(key)) return;
+  localStorage.setItem(key, "1");
+
+  if (tier === "tiny") {
+    if (lowRamModeToggle) lowRamModeToggle.checked = true;
+    if (autoUnloadPressureToggle) autoUnloadPressureToggle.checked = true;
+    if (autoUnloadIdleToggle) autoUnloadIdleToggle.checked = true;
+    saveSettings();
+    appendSystemNotice(
+      `**${ramGb} GB RAM detected** — Low RAM mode and auto-free options are on. ` +
+        "Use **llama3.2:1b** or **llama3.1:8b** only; 14B/32B models will choke the system.",
+    );
+  } else if (tier === "low") {
+    appendSystemNotice(
+      `**${ramGb} GB RAM detected** — enable **Low RAM mode** in Options if Cursor feels sluggish with 8B models.`,
+    );
+  }
+}
+
+function touchChatActivity() {
+  lastChatActivity = Date.now();
+}
+
+async function fetchSystemSnapshot() {
+  try {
+    const res = await fetch("/api/system", { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function applyResourceUi(snap) {
+  systemSnapshot = snap;
+  if (!snap) {
+    if (resourceModelEl) resourceModelEl.textContent = "Memory stats unavailable";
+    return;
+  }
+
+  const pct = snap.ram_used_pct;
+  if (ramBarFill && pct != null) {
+    ramBarFill.style.width = `${Math.min(100, pct)}%`;
+    ramBarFill.classList.remove("warn", "critical");
+    if (snap.memory_pressure === "critical") ramBarFill.classList.add("critical");
+    else if (snap.memory_pressure === "warn") ramBarFill.classList.add("warn");
+  }
+  if (ramPctEl) {
+    ramPctEl.textContent = pct != null ? `${Math.round(pct)}%` : "—";
+  }
+
+  const models = snap.ollama_models || [];
+  if (resourceModelEl) {
+    if (models.length) {
+      const names = models.map((m) => m.name).join(", ");
+      resourceModelEl.textContent = `Model in RAM: ${names} (~${snap.ollama_vram_gb ?? "?"} GB)`;
+    } else if (serverRunning) {
+      resourceModelEl.textContent = "No model loaded in RAM";
+    } else {
+      resourceModelEl.textContent = "Chat stopped · Ollama may still be running";
+    }
+  }
+
+  const showFree = models.length > 0 && serverRunning;
+  if (freeRamBtn) {
+    freeRamBtn.classList.toggle("hidden", !showFree);
+    freeRamBtn.disabled = !serverRunning || serverActionInProgress;
+  }
+
+  if (resourceWarnEl) {
+    if (snap.memory_pressure !== "normal" && snap.memory_message) {
+      resourceWarnEl.textContent = snap.memory_message;
+      resourceWarnEl.classList.remove("hidden");
+    } else {
+      resourceWarnEl.classList.add("hidden");
+      resourceWarnEl.textContent = "";
+    }
+  }
+
+  if (statusDot && !streaming) {
+    if (snap.memory_pressure === "critical") statusDot.className = "status-dot warn";
+    else if (snap.memory_pressure === "warn") statusDot.className = "status-dot warn";
+  }
+  refreshComposerState();
+}
+
+async function maybeAutoFreeRam(snap) {
+  if (!snap || streaming || serverActionInProgress || !serverRunning) return;
+  const models = snap.ollama_models || [];
+  if (!models.length) return;
+  if (Date.now() - lastAutoUnloadAt < AUTO_UNLOAD_COOLDOWN_MS) return;
+
+  let reason = null;
+  if (autoUnloadPressureToggle?.checked && snap.should_unload) {
+    reason = snap.memory_message || "System memory is tight.";
+  }
+  if (
+    autoUnloadIdleToggle?.checked &&
+    Date.now() - lastChatActivity >= idleUnloadMs()
+  ) {
+    reason = `Idle for ${memoryTier() === "tiny" ? "5+" : "10+"} minutes.`;
+  }
+  if (!reason) return;
+
+  lastAutoUnloadAt = Date.now();
+  appendSystemNotice(`**Auto freeing model RAM** — ${reason}`);
+  await unloadModels();
+  await refreshResources();
+}
+
+async function refreshResources() {
+  const snap = await fetchSystemSnapshot();
+  applyResourceUi(snap);
+  await maybeAutoFreeRam(snap);
+  return snap;
+}
+
+function scheduleResourcePoll() {
+  clearInterval(resourcePollTimer);
+  resourcePollTimer = setInterval(() => {
+    if (serverActionInProgress) return;
+    refreshResources();
+  }, 8000);
+}
+
+async function freeModelRam() {
+  if (!serverRunning) return;
+  freeRamBtn.disabled = true;
+  try {
+    const res = await fetch("/api/unload", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    const names = (data.unloaded || []).join(", ") || "models";
+    appendSystemNotice(`Freed RAM — unloaded **${names}** from memory.\n\nOllama is still running; the next message will reload the model.`);
+    await refreshResources();
+  } catch (e) {
+    alert(`Could not free RAM: ${e.message || e}`);
+  } finally {
+    if (freeRamBtn) freeRamBtn.disabled = !serverRunning;
+  }
+}
 let serverRunning = true;
 let serverActionInProgress = false;
 let serverPollTimer = null;
@@ -1363,16 +1661,312 @@ async function waitForServerState(running, timeoutMs = 15000) {
   return fetchServerStatus();
 }
 
-function setComposerEnabled(on) {
-  const allow = on && serverRunning;
-  if (!streaming) {
-    userInput.disabled = !allow;
-    sendBtn.disabled = !allow || !modelSelect.value;
+function getComposerBlockReason() {
+  if (streaming) {
+    return {
+      level: "info",
+      message: "Generating reply… press Send or Esc to stop.",
+      canSend: true,
+      canType: false,
+      action: null,
+      actionLabel: null,
+    };
   }
-  if (attachBtn) attachBtn.disabled = !allow;
-  if (modelSelect) modelSelect.disabled = !allow;
-  if (newChatBtn) newChatBtn.disabled = !allow;
+  if (serverActionInProgress) {
+    return {
+      level: "warn",
+      message: "Server is starting or stopping — wait a moment.",
+      canSend: false,
+      canType: false,
+      action: null,
+      actionLabel: null,
+    };
+  }
+  if (!serverRunning) {
+    return {
+      level: "warn",
+      message: "Send is off because the chat worker is stopped. Start it to continue.",
+      canSend: false,
+      canType: false,
+      action: "start_server",
+      actionLabel: "Start server",
+    };
+  }
+  const modelLabel = modelSelect?.options[modelSelect.selectedIndex]?.textContent?.trim() || "";
+  if (!modelSelect?.value) {
+    if (/unavailable|offline/i.test(modelLabel)) {
+      return {
+        level: "error",
+        message: "Send is off — Ollama is not reachable. Start it with: brew services start ollama",
+        canSend: false,
+        canType: true,
+        action: "retry_models",
+        actionLabel: "Retry connection",
+      };
+    }
+    if (/no models/i.test(modelLabel)) {
+      return {
+        level: "warn",
+        message: "Send is off — no models installed. Run: ollama pull llama3.1:8b",
+        canSend: false,
+        canType: true,
+        action: "retry_models",
+        actionLabel: "Refresh models",
+      };
+    }
+    if (/stopped/i.test(modelLabel)) {
+      return {
+        level: "warn",
+        message: "Send is off — chat worker is stopped.",
+        canSend: false,
+        canType: false,
+        action: "start_server",
+        actionLabel: "Start server",
+      };
+    }
+    return {
+      level: "warn",
+      message: "Send is off — pick a model in the sidebar.",
+      canSend: false,
+      canType: true,
+      action: "retry_models",
+      actionLabel: "Load models",
+    };
+  }
+  const selected = modelSelect.value;
+  if (memoryTier() === "tiny" && (isHeavyModel(selected) || isMediumModel(selected))) {
+    return {
+      level: "error",
+      message: `${selected} is too large for ${systemRamGb} GB RAM — switch to llama3.2:1b or llama3.1:8b`,
+      canSend: false,
+      canType: true,
+      action: "retry_models",
+      actionLabel: "Pick safe model",
+    };
+  }
+  if (memoryTier() === "low" && isHeavyModel(selected)) {
+    return {
+      level: "error",
+      message: `${selected} will choke a ${systemRamGb} GB Mac — use an 8B model instead`,
+      canSend: false,
+      canType: true,
+      action: "retry_models",
+      actionLabel: "Pick smaller model",
+    };
+  }
+  if (systemSnapshot?.memory_pressure === "critical") {
+    return {
+      level: "error",
+      message: `Memory tight (${systemSnapshot.memory_message || "system is under pressure"}). Free model RAM or use Stop server.`,
+      canSend: true,
+      canType: true,
+      action: "free_ram",
+      actionLabel: "Free model RAM",
+    };
+  }
+  if (systemSnapshot?.memory_pressure === "warn" && systemSnapshot?.ollama_vram_gb > 0) {
+    return {
+      level: "warn",
+      message: systemSnapshot.memory_message || "High memory use — Cursor may feel slow.",
+      canSend: true,
+      canType: true,
+      action: "free_ram",
+      actionLabel: "Free model RAM",
+    };
+  }
+  return {
+    level: "ok",
+    message: "",
+    canSend: true,
+    canType: true,
+    action: null,
+    actionLabel: null,
+  };
 }
+
+function renderComposerStatus(reason, { healing = false, stuck = false } = {}) {
+  if (!composerStatusEl) return;
+  if (healing) {
+    composerStatusEl.className = "composer-status healing" + (stuck ? " pulse" : "");
+    composerStatusEl.innerHTML = `<span class="composer-status-text">Recovering connection…</span>`;
+    composerStatusEl.classList.remove("hidden");
+    return;
+  }
+  if (!reason || reason.level === "ok" || !reason.message) {
+    composerStatusEl.className = "composer-status hidden";
+    composerStatusEl.innerHTML = "";
+    composerStatusEl.classList.add("hidden");
+    return;
+  }
+  composerStatusEl.className = `composer-status ${reason.level}` + (stuck ? " pulse" : "");
+  let html = `<span class="composer-status-text">${escapeHtml(reason.message)}</span>`;
+  if (reason.action && reason.actionLabel) {
+    html += `<button type="button" class="composer-status-action" data-composer-action="${reason.action}">${escapeHtml(reason.actionLabel)}</button>`;
+  }
+  if (stuck) {
+    html += `<button type="button" class="composer-status-action" data-composer-action="heal">Recover now</button>`;
+  }
+  composerStatusEl.innerHTML = html;
+  composerStatusEl.classList.remove("hidden");
+}
+
+function refreshComposerState() {
+  const reason = getComposerBlockReason();
+  const canInteract = serverRunning && !serverActionInProgress;
+  const stuck =
+    !reason.canSend && !streaming && composerBlockedSince > 0 &&
+    Date.now() - composerBlockedSince > COMPOSER_STUCK_MS;
+
+  if (!reason.canSend && !streaming) {
+    if (!composerBlockedSince) composerBlockedSince = Date.now();
+  } else {
+    composerBlockedSince = 0;
+  }
+
+  if (streaming) {
+    sendBtn.disabled = false;
+    sendBtn.classList.remove("is-blocked");
+    userInput.disabled = true;
+  } else {
+    userInput.disabled = !canInteract || !reason.canType;
+    const sendOff = !reason.canSend || !canInteract || !modelSelect?.value;
+    sendBtn.disabled = sendOff;
+    sendBtn.classList.toggle("is-blocked", sendOff);
+  }
+
+  if (attachBtn) attachBtn.disabled = !canInteract;
+  if (modelSelect) modelSelect.disabled = !canInteract;
+  if (newChatBtn) newChatBtn.disabled = !canInteract;
+
+  sendBtn.title = reason.message || (streaming ? "Stop generating" : "Send message");
+  userInput.title = reason.canType ? "" : reason.message;
+
+  if (!healInProgress) {
+    if (streaming && reason.canSend) {
+      composerStatusEl.classList.add("hidden");
+    } else {
+      renderComposerStatus(reason, { stuck });
+    }
+  }
+}
+
+function setComposerEnabled(on) {
+  refreshComposerState();
+}
+
+function resetStreamingState(notice) {
+  streaming = false;
+  streamAbort = null;
+  streamStartedAt = 0;
+  lastStreamActivityAt = 0;
+  setComposerStreaming(false);
+  if (notice) appendSystemNotice(notice);
+  refreshComposerState();
+}
+
+async function runComposerAction(action) {
+  if (action === "start_server") await startServer();
+  else if (action === "retry_models") await loadModels();
+  else if (action === "free_ram") await freeModelRam();
+  else if (action === "heal") await attemptSelfHeal(true);
+  refreshComposerState();
+}
+
+async function attemptSelfHeal(force = false) {
+  if (healInProgress) return false;
+  if (!force && Date.now() - lastHealAt < HEAL_COOLDOWN_MS) return false;
+  healInProgress = true;
+  lastHealAt = Date.now();
+  renderComposerStatus(null, { healing: true });
+
+  try {
+    if (streaming) {
+      streamAbort?.abort();
+      resetStreamingState("Stopped a stuck request so you can try again.");
+    }
+
+    const st = await fetchServerStatus();
+    if (!st.running) {
+      appendSystemNotice("Chat worker was down — **restarting** automatically.");
+      const res = await fetch("/api/server/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!data.ok) throw new Error(data.error || "Could not restart worker");
+      await waitForServerState(true, 25000);
+      applyServerUi(true);
+    } else if (!modelSelect?.value) {
+      await loadModels();
+    }
+
+    const snap = await refreshResources();
+    if (snap?.should_unload && autoUnloadPressureToggle?.checked) {
+      await unloadModels();
+      appendSystemNotice("Freed model RAM automatically — memory was critically low.");
+    }
+
+    appendSystemNotice("**Recovered** — you can send again.");
+    return true;
+  } catch (e) {
+    appendSystemNotice(`Recovery failed: ${e.message || e}. Try **Start server** or **Free model RAM**.`);
+    return false;
+  } finally {
+    healInProgress = false;
+    refreshComposerState();
+  }
+}
+
+function scheduleHealthWatchdog() {
+  clearInterval(healthWatchdogTimer);
+  healthWatchdogTimer = setInterval(async () => {
+    if (healInProgress || serverActionInProgress) return;
+
+    if (streaming && streamStartedAt) {
+      const silent = lastStreamActivityAt ? Date.now() - lastStreamActivityAt : Date.now() - streamStartedAt;
+      const total = Date.now() - streamStartedAt;
+      const maxMs = streamMaxMs();
+      const stallMs = streamStallMs();
+      if (total > maxMs || silent > stallMs) {
+        appendSystemNotice(
+          total > maxMs
+            ? "Request took too long — stopping and freeing resources."
+            : "No response from model (memory or Ollama stall) — recovering…",
+        );
+        streamAbort?.abort();
+        if (systemSnapshot?.ollama_vram_gb > 0 && autoUnloadPressureToggle?.checked) {
+          await unloadModels();
+        }
+        resetStreamingState("Request timed out. Try again, or enable **Low RAM mode** in Options.");
+        await attemptSelfHeal(true);
+        return;
+      }
+    }
+
+    if (!streaming && sendBtn?.disabled && serverRunning && composerBlockedSince &&
+        Date.now() - composerBlockedSince > COMPOSER_STUCK_MS) {
+      await attemptSelfHeal(false);
+    }
+
+    try {
+      const st = await fetchServerStatus();
+      if (serverRunning && !st.running && !streaming) {
+        applyServerUi(false);
+        appendSystemNotice("Chat worker stopped unexpectedly — click **Start server** or wait for auto-recovery.");
+        await attemptSelfHeal(false);
+      }
+    } catch {
+      /* ignore transient network blips */
+    }
+  }, 10000);
+}
+
+composerStatusEl?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-composer-action]");
+  if (!btn) return;
+  runComposerAction(btn.dataset.composerAction);
+});
 
 function showStoppedWelcome() {
   messagesEl.innerHTML = `
@@ -1397,7 +1991,7 @@ function applyServerUi(running) {
   const footerHint = document.getElementById("footer-hint");
   if (footerHint) {
     footerHint.textContent = running
-      ? "Stop frees model RAM · this page stays open"
+      ? "Stop unloads model RAM · Ollama app keeps running"
       : "Start server to chat again — no Terminal needed";
   }
   setComposerEnabled(running);
@@ -1446,12 +2040,16 @@ async function toggleServer() {
 async function stopServer() {
   if (
     !confirm(
-      "Stop the chat worker and free model RAM?\n\nYou can start again with the Start server button — no Terminal needed.",
+      "Stop the chat worker and unload models from RAM?\n\n" +
+        "• Ollama keeps running (not quit)\n" +
+        "• Cursor should feel snappier\n" +
+        "• Click Start server to chat again",
     )
   ) {
     return;
   }
   serverActionInProgress = true;
+  refreshComposerState();
   stopBtn.disabled = true;
   stopBtn.textContent = "Stopping…";
   streamAbort?.abort();
@@ -1467,17 +2065,20 @@ async function stopServer() {
     await waitForServerState(false, 12000);
     applyServerUi(false);
     setStatus(false, "Server stopped");
+    await refreshResources();
   } catch (e) {
     alert(`Stop failed: ${e.message || e}`);
     await refreshServerStatus();
   } finally {
     serverActionInProgress = false;
     applyServerUi(serverRunning);
+    refreshComposerState();
   }
 }
 
 async function startServer() {
   serverActionInProgress = true;
+  refreshComposerState();
   stopBtn.disabled = true;
   stopBtn.textContent = "Starting…";
   setStatus(false, "Starting server…");
@@ -1500,6 +2101,7 @@ async function startServer() {
     renderMessages();
     await loadModels();
     setStatus(true, `Connected · ${modelSelect.value || "ready"}`);
+    await refreshResources();
   } catch (e) {
     alert(`Start failed: ${e.message || e}`);
     applyServerUi(false);
@@ -1507,6 +2109,7 @@ async function startServer() {
   } finally {
     serverActionInProgress = false;
     applyServerUi(serverRunning);
+    refreshComposerState();
   }
 }
 
@@ -1549,6 +2152,7 @@ function activityLabelFromMeta(meta) {
     if (h === "fx") return "Fetched exchange rate";
     if (h === "crypto") return "Fetched crypto price";
     if (h === "espn") return "Fetched live scores";
+    if (h === "web") return "Searched the web";
     if (h === "time") return "Checked time";
     return "Fetched live data";
   }
@@ -1608,6 +2212,8 @@ async function loadModels() {
     if (systemRes?.ok) {
       const sys = await systemRes.json();
       systemRamGb = sys.ram_gb ?? null;
+      applyResourceUi(sys);
+      applyRamTierDefaults(systemRamGb);
     }
 
     const data = await modelsRes.json();
@@ -1634,7 +2240,16 @@ async function loadModels() {
       /* ignore */
     }
     if (savedModel && models.includes(savedModel)) {
-      modelSelect.value = savedModel;
+      const tier = memoryTier();
+      if (tier === "tiny" && (isHeavyModel(savedModel) || isMediumModel(savedModel))) {
+        modelSelect.value = pickBestModel(models);
+        saveSettings();
+      } else if (tier === "low" && isHeavyModel(savedModel)) {
+        modelSelect.value = pickBestModel(models);
+        saveSettings();
+      } else {
+        modelSelect.value = savedModel;
+      }
     } else {
       modelSelect.value = pickBestModel(models);
       saveSettings();
@@ -1643,10 +2258,13 @@ async function loadModels() {
     updateModelHint(models);
     setStatus(true, `Ollama · ${models.length} model(s)`);
     warmModel();
+    refreshResources();
   } catch (e) {
     setStatus(false, "Ollama offline");
     modelSelect.innerHTML = '<option value="">Unavailable</option>';
     showError("Cannot reach Ollama. Start it with: brew services start ollama");
+  } finally {
+    refreshComposerState();
   }
 }
 
@@ -1778,11 +2396,13 @@ function setComposerStreaming(active) {
   sendBtn.classList.toggle("is-streaming", active);
   sendBtn.setAttribute("aria-label", active ? "Stop generating" : "Send");
   if (active) {
-    sendBtn.disabled = false;
-    userInput.disabled = true;
-    return;
+    streamStartedAt = Date.now();
+    lastStreamActivityAt = Date.now();
+  } else {
+    streamStartedAt = 0;
+    lastStreamActivityAt = 0;
   }
-  setComposerEnabled(serverRunning);
+  refreshComposerState();
 }
 
 function stopGeneration() {
@@ -1815,6 +2435,8 @@ function buildPayload() {
     messages: finalMsgs,
     stream: true,
     fast_mode: fastModeToggle?.checked ?? false,
+    low_ram_mode: lowRamModeToggle?.checked ?? false,
+    ram_tier: memoryTier(),
     web_search: useWeb,
     web_search_force: useWeb || isForcedWebSearch(lastUser) || verify,
     verify_facts: verify,
@@ -1828,13 +2450,21 @@ function buildPayload() {
 }
 
 async function sendMessage(text, { regenerate = false } = {}) {
+  touchChatActivity();
   const trimmed = text.trim();
   const attached = hasAttachments();
   if (!serverRunning) {
-    alert("Server is stopped. Click Start server in the sidebar.");
+    refreshComposerState();
+    appendSystemNotice("Chat worker is stopped — click **Start server** in the sidebar.");
     return;
   }
-  if ((!trimmed && !attached) || streaming || !modelSelect.value) return;
+  if (!trimmed && !attached) return;
+  if (streaming) return;
+  if (!modelSelect.value) {
+    refreshComposerState();
+    appendSystemNotice(getComposerBlockReason().message || "Pick a model in the sidebar.");
+    return;
+  }
 
   let chat = getActiveChat();
   if (!chat) {
@@ -1956,7 +2586,11 @@ async function runGeneration(chat, userText) {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
-      throw new Error(err.error || "Chat request failed");
+      const msg = err.error || "Chat request failed";
+      if (res.status === 502 || res.status === 503) {
+        throw new Error(`${msg} — worker may have crashed (low memory?). Trying to recover…`);
+      }
+      throw new Error(msg);
     }
 
     const reader = res.body.getReader();
@@ -1982,6 +2616,7 @@ async function runGeneration(chat, userText) {
           }
         }
         if (chunk.message?.content) {
+          lastStreamActivityAt = Date.now();
           full += chunk.message.content;
           const visible = visibleAssistantText(full);
           if (visible) onFirstContent();
@@ -2027,13 +2662,20 @@ async function runGeneration(chat, userText) {
         /* keep user message */
       }
       await flushChats();
+      if (/502|503|fetch|network|ollama|memory|crash|recover/i.test(String(e.message))) {
+        await attemptSelfHeal(true);
+      }
     }
   } finally {
     streaming = false;
     streamAbort = null;
+    streamStartedAt = 0;
+    lastStreamActivityAt = 0;
     placeholder.clearActivity();
     setComposerStreaming(false);
     userInput.focus();
+    refreshResources();
+    refreshComposerState();
   }
 }
 
@@ -2095,6 +2737,13 @@ chatForm.addEventListener("submit", (e) => {
     stopGeneration();
     return;
   }
+  if (sendBtn.disabled) {
+    refreshComposerState();
+    const reason = getComposerBlockReason();
+    if (reason.action) runComposerAction(reason.action);
+    else if (reason.message) appendSystemNotice(reason.message);
+    return;
+  }
   const text = userInput.value;
   userInput.value = "";
   userInput.style.height = "auto";
@@ -2124,6 +2773,10 @@ fastModeToggle.addEventListener("change", () => {
   warmModel();
 });
 unloadOnCloseToggle.addEventListener("change", saveSettings);
+lowRamModeToggle?.addEventListener("change", saveSettings);
+autoUnloadPressureToggle?.addEventListener("change", saveSettings);
+autoUnloadIdleToggle?.addEventListener("change", saveSettings);
+freeRamBtn?.addEventListener("click", freeModelRam);
 modeTrigger?.addEventListener("click", (e) => {
   e.stopPropagation();
   toggleModeMenu();
@@ -2155,6 +2808,9 @@ repoSetBtn?.addEventListener("click", async () => {
   }
 });
 attachBtn?.addEventListener("click", () => fileInput?.click());
+userInput?.addEventListener("paste", (e) => {
+  handleComposerPaste(e);
+});
 fileInput?.addEventListener("change", () => {
   for (const file of fileInput.files || []) {
     addAttachmentFile(file);
@@ -2165,6 +2821,7 @@ document.getElementById("settings-panel")?.addEventListener("toggle", saveSettin
 modelSelect.addEventListener("change", () => {
   saveSettings();
   updateModelHint([...modelSelect.options].map((o) => o.value).filter(Boolean));
+  refreshComposerState();
   warmModel();
 });
 
@@ -2204,6 +2861,9 @@ async function bootstrap() {
   renderMessages();
   updateComposerPlaceholder();
   bindSuggestions();
+  await refreshResources();
+  scheduleResourcePoll();
+  scheduleHealthWatchdog();
   if (serverRunning) {
     loadModels();
   }

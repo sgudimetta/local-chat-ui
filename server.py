@@ -183,7 +183,9 @@ class ChatHandler(SimpleHTTPRequestHandler):
             self._server_status()
             return
         if self.path == "/api/system":
-            self._json_response(200, {"ram_gb": system_ram_gb()})
+            from system_monitor import build_system_snapshot
+
+            self._json_response(200, build_system_snapshot())
             return
         if self.path == "/api/repo":
             root = get_repo_root()
@@ -334,11 +336,19 @@ class ChatHandler(SimpleHTTPRequestHandler):
             return
         model = payload.get("model", "llama3.1:8b")
         fast = payload.get("fast_mode", False)
+        low_ram = payload.get("low_ram_mode", False)
+        ram_tier = payload.get("ram_tier")
+        if ram_tier == "tiny" or (low_ram and (system_ram_gb() or 99) <= 8):
+            keep = "2m"
+        elif low_ram or ram_tier == "low":
+            keep = "5m"
+        else:
+            keep = "30m"
         req_body = json.dumps({
             "model": model,
             "prompt": " ",
             "stream": False,
-            "keep_alive": "30m",
+            "keep_alive": keep,
             "options": self._perf_options(fast),
         }).encode()
         req = urllib.request.Request(
@@ -374,7 +384,15 @@ class ChatHandler(SimpleHTTPRequestHandler):
 
     def _apply_perf_options(self, payload: dict) -> None:
         fast = payload.pop("fast_mode", False)
-        payload.setdefault("keep_alive", "30m")
+        low_ram = payload.pop("low_ram_mode", False)
+        ram_tier = payload.pop("ram_tier", None)
+        if ram_tier == "tiny" or (low_ram and (system_ram_gb() or 99) <= 8):
+            keep = "2m"
+        elif low_ram or ram_tier == "low":
+            keep = "5m"
+        else:
+            keep = "30m"
+        payload.setdefault("keep_alive", keep)
         opts = payload.setdefault("options", {})
         for k, v in self._perf_options(fast).items():
             opts.setdefault(k, v)
@@ -665,11 +683,15 @@ class ChatHandler(SimpleHTTPRequestHandler):
             "3. Give a polished answer in your own words — structured, no filler, no visible planning.\n"
             "4. NEVER tell the user to check a website, enable search, or ask which season/year.\n"
             "5. NEVER say you need more context if the reference contains the answer.\n"
-            "6. If the reference is thin, say what you found and what's uncertain — still answer fully.\n"
+            "6. NEVER say you cannot verify or that the reference does not mention something "
+            "when the reference clearly contains the answer — state the facts directly.\n"
+            "7. NEVER use dates from training memory (e.g. 2023) for 'current/latest' questions — "
+            "only dates that appear in the reference and its 'Today is …' line.\n"
+            "8. If the reference is thin, say what you found and what's uncertain — still answer fully.\n"
         )
         if verify_facts:
             web_rules += (
-                "7. VERIFICATION MODE: version numbers, release dates, and 'latest/current' claims "
+                "9. VERIFICATION MODE: version numbers, release dates, and 'latest/current' claims "
                 "must come ONLY from the reference and its 'Today is …' line — not from memory.\n"
             )
         web_part = f"{web_rules}\n{context}"
