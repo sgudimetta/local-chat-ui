@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -77,6 +78,7 @@ WMO_WEATHER = {
 }
 
 ESPN_LEAGUES = (
+    {"pattern": re.compile(r"(?i)\b(f1|formula\s*one|formula\s*1|grand\s*prix)\b"), "sport": "racing", "league": "f1", "label": "Formula 1", "racing": True},
     {"pattern": re.compile(r"(?i)\b(fifa|world\s*cup|worldcup)\b"), "sport": "soccer", "league": "fifa.world", "label": "FIFA World Cup"},
     {"pattern": re.compile(r"(?i)\b(nfl|super\s*bowl|superbowl)\b"), "sport": "football", "league": "nfl", "label": "NFL"},
     {"pattern": re.compile(r"(?i)\b(nba|basketball)\b"), "sport": "basketball", "league": "nba", "label": "NBA"},
@@ -88,7 +90,7 @@ ESPN_LEAGUES = (
 SPORTS_LIVE_PATTERN = re.compile(
     r"(?i)\b("
     r"next|upcoming|schedule|fixture|when|where|today|tonight|live|score|scores|"
-    r"who won|kickoff|kick off|game|match"
+    r"who won|kickoff|kick off|game|match|race|grand\s*prix"
     r")\b"
 )
 
@@ -124,6 +126,13 @@ LOCAL_ONLY_PATTERN = re.compile(
     r"brainstorm|summarize|summary|translate|debug|teach me|walk me through|recommend|suggest)\b"
 )
 
+FACTUAL_QUERY_PATTERN = re.compile(
+    r"(?i)\b(who|what|when|where|which|how many|how much|tell me)\b|"
+    r"\b(when is|what is|what's|who is|who's|where is|how old|next|upcoming|"
+    r"latest|current|today|tonight|schedule|fixture|price|cost|score|standings|"
+    r"release date|who won|how tall|population of|capital of)\b"
+)
+
 LIVE_REQUIRED_PATTERN = re.compile(
     r"(?i)\b(current|today'?s?|latest|right now|as of now|as of today|this week|this month|live)\b|"
     r"\b(weather|forecast|temperature)\b.*\b(today|tomorrow|now|in\s+\w)|"
@@ -132,7 +141,8 @@ LIVE_REQUIRED_PATTERN = re.compile(
     r"\b(bitcoin|ethereum|crypto|btc|eth)\s*(price|cost|worth)?\b|"
     r"\b(what time is it|time in\s+)\b|"
     r"\b(who won|final score|live score)\b|"
-    r"\b(next\s+(?:game|match|fixture)|upcoming\s+(?:game|match))\b|"
+    r"\b(next\s+(?:game|match|fixture|race|grand\s*prix)|upcoming\s+(?:game|match|race))\b|"
+    r"\b(f1|formula\s*one|formula\s*1|grand\s*prix)\b.*\b(next|schedule|when|where|today|live|race)\b|"
     r"\b(world\s*cup|worldcup|fifa|nfl|nba|mlb)\b.*\b(next|schedule|score|today|live)\b|"
     r"\b(look up online|search the web|search online|find online|check online)\b"
 )
@@ -162,9 +172,11 @@ def query_needs_internet(query: str, *, force_search: bool = False) -> bool:
     if force_search:
         return True
     q = FORCE_SEARCH_PREFIX.sub("", query).strip()
-    if LOCAL_ONLY_PATTERN.search(q):
+    if LOCAL_ONLY_PATTERN.search(q) and not FACTUAL_QUERY_PATTERN.search(q):
         return False
     if query_needs_verification(q):
+        return True
+    if FACTUAL_QUERY_PATTERN.search(q):
         return True
     return bool(LIVE_REQUIRED_PATTERN.search(q))
 
@@ -199,14 +211,36 @@ def _cache_set(key: str, data: dict) -> None:
 
 def _fetch_json(url: str, timeout: int = 12) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as e:
+        if "SSL" not in str(e) and "certificate" not in str(e).lower():
+            raise
+        proc = subprocess.run(
+            ["curl", "-sf", "--max-time", str(timeout), "-A", USER_AGENT, url],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(proc.stdout)
 
 
 def _fetch_text(url: str, timeout: int = 12) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        if "SSL" not in str(e) and "certificate" not in str(e).lower():
+            raise
+        proc = subprocess.run(
+            ["curl", "-sf", "--max-time", str(timeout), "-A", USER_AGENT, url],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return proc.stdout
 
 
 def _now_line() -> str:
@@ -263,7 +297,7 @@ def format_fx_answer(fx: dict) -> str:
     )
 
 
-def search_duckduckgo(query: str, max_results: int = 5) -> list[dict]:
+def search_duckduckgo(query: str, max_results: int = 8) -> list[dict]:
     url = f"https://lite.duckduckgo.com/lite/?q={quote(query)}"
     html = unescape(_fetch_text(url, timeout=15))
     rows = html.split("<tr")
@@ -359,6 +393,8 @@ def refine_search_query(query: str) -> str:
     if query_needs_verification(query):
         year = date.today().year
         return f"{query.strip()} latest official release date {year}"
+    if re.search(r"(?i)\b(f1|formula\s*one|formula\s*1|grand\s*prix)\b", query):
+        return f"Formula 1 next race schedule {date.today().year} {query.strip()}"
     if re.search(r"(?i)\b(world\s*cup|worldcup|fifa)\b", query) and re.search(
         r"(?i)\b(next|upcoming|schedule|fixture|when|where|match|game)\b", query
     ):
@@ -591,9 +627,45 @@ def handle_weather(query: str) -> HandlerResult | None:
         return None
 
 
-def _parse_espn_event(event: dict) -> dict | None:
+def _parse_espn_event(event: dict, *, racing: bool = False) -> dict | None:
     comp = (event.get("competitions") or [{}])[0]
     competitors = comp.get("competitors") or []
+    venue = comp.get("venue") or {}
+    status = comp.get("status", {}).get("type", {})
+    kickoff_raw = event.get("date") or comp.get("date")
+    if not kickoff_raw:
+        return None
+    kickoff = datetime.fromisoformat(kickoff_raw.replace("Z", "+00:00"))
+    state = status.get("state") or ""
+    status_desc = status.get("description") or status.get("shortDetail") or ""
+
+    team_names = [c.get("team", {}).get("displayName") for c in competitors[:2]]
+    is_racing = racing or (
+        len(competitors) != 2 or not all(team_names) or bool(competitors and competitors[0].get("athlete"))
+    )
+
+    if is_racing:
+        race_name = event.get("name") or event.get("shortName") or "Race"
+        scores = status_desc or "Scheduled"
+        if state == "post" and competitors:
+            winner = next((c for c in competitors if str(c.get("order")) == "1"), competitors[0])
+            wname = (winner.get("athlete") or {}).get("displayName") or "?"
+            scores = f"Winner: {wname}"
+        elif state == "in" and competitors:
+            leader = next((c for c in competitors if str(c.get("order")) == "1"), None)
+            if leader:
+                scores = f"Leader: {(leader.get('athlete') or {}).get('displayName', '?')}"
+        return {
+            "teams": race_name,
+            "scores": scores,
+            "venue": venue.get("fullName") or "TBD",
+            "city": (venue.get("address") or {}).get("city") or "",
+            "kickoff": kickoff,
+            "state": state,
+            "status": status_desc,
+            "racing": True,
+        }
+
     if len(competitors) < 2:
         return None
     teams = " vs ".join(c.get("team", {}).get("displayName", "?") for c in competitors[:2])
@@ -601,24 +673,19 @@ def _parse_espn_event(event: dict) -> dict | None:
         f"{c.get('team', {}).get('displayName', '?')} {c.get('score', '0')}"
         for c in competitors[:2]
     )
-    venue = comp.get("venue") or {}
-    status = comp.get("status", {}).get("type", {})
-    kickoff_raw = event.get("date") or comp.get("date")
-    if not kickoff_raw:
-        return None
-    kickoff = datetime.fromisoformat(kickoff_raw.replace("Z", "+00:00"))
     return {
         "teams": teams,
         "scores": scores,
         "venue": venue.get("fullName") or "TBD",
         "city": (venue.get("address") or {}).get("city") or "",
         "kickoff": kickoff,
-        "state": status.get("state") or "",
-        "status": status.get("description") or status.get("shortDetail") or "",
+        "state": state,
+        "status": status_desc,
+        "racing": False,
     }
 
 
-def _fetch_espn_events(sport: str, league: str, day: date) -> list[dict]:
+def _fetch_espn_events(sport: str, league: str, day: date, *, racing: bool = False) -> list[dict]:
     url = (
         f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
         f"?dates={day.strftime('%Y%m%d')}"
@@ -626,7 +693,21 @@ def _fetch_espn_events(sport: str, league: str, day: date) -> list[dict]:
     data = _fetch_json(url)
     events: list[dict] = []
     for raw in data.get("events") or []:
-        parsed = _parse_espn_event(raw)
+        parsed = _parse_espn_event(raw, racing=racing)
+        if parsed:
+            events.append(parsed)
+    return events
+
+
+def _fetch_espn_racing_events(sport: str, league: str, start: date, end: date) -> list[dict]:
+    url = (
+        f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+        f"?dates={start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
+    )
+    data = _fetch_json(url)
+    events: list[dict] = []
+    for raw in data.get("events") or []:
+        parsed = _parse_espn_event(raw, racing=True)
         if parsed:
             events.append(parsed)
     return events
@@ -651,26 +732,50 @@ def handle_espn_sports(query: str) -> HandlerResult | None:
     now = datetime.now(timezone.utc)
     events: list[dict] = []
     sources: list[dict] = []
-    for offset in range(-1, 4):
-        day = (now + timedelta(days=offset)).date()
+    is_racing = bool(league.get("racing"))
+
+    if is_racing:
+        start = (now - timedelta(days=1)).date()
+        end = (now + timedelta(days=120)).date()
         try:
-            day_events = _fetch_espn_events(league["sport"], league["league"], day)
-            events.extend(day_events)
-            if day_events:
+            events = _fetch_espn_racing_events(league["sport"], league["league"], start, end)
+            if events:
                 sources.append(
                     {
-                        "title": f"ESPN {league['label']} ({day.isoformat()})",
+                        "title": f"ESPN {league['label']} ({start.isoformat()} – {end.isoformat()})",
                         "snippet": "; ".join(
-                            f"{e['teams']} @ {e['venue']} ({e['status']})" for e in day_events[:6]
+                            f"{e['teams']} ({e['status']})" for e in events[:8]
                         ),
                         "url": (
                             f"https://site.api.espn.com/apis/site/v2/sports/"
-                            f"{league['sport']}/{league['league']}/scoreboard?dates={day.strftime('%Y%m%d')}"
+                            f"{league['sport']}/{league['league']}/scoreboard"
+                            f"?dates={start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
                         ),
                     }
                 )
         except (urllib.error.URLError, ValueError, KeyError):
-            continue
+            events = []
+    else:
+        for offset in range(-1, 4):
+            day = (now + timedelta(days=offset)).date()
+            try:
+                day_events = _fetch_espn_events(league["sport"], league["league"], day)
+                events.extend(day_events)
+                if day_events:
+                    sources.append(
+                        {
+                            "title": f"ESPN {league['label']} ({day.isoformat()})",
+                            "snippet": "; ".join(
+                                f"{e['teams']} @ {e['venue']} ({e['status']})" for e in day_events[:6]
+                            ),
+                            "url": (
+                                f"https://site.api.espn.com/apis/site/v2/sports/"
+                                f"{league['sport']}/{league['league']}/scoreboard?dates={day.strftime('%Y%m%d')}"
+                            ),
+                        }
+                    )
+            except (urllib.error.URLError, ValueError, KeyError):
+                continue
 
     if not events:
         if league:
@@ -703,6 +808,9 @@ def handle_espn_sports(query: str) -> HandlerResult | None:
 
     lines = [f"**{league['label']}** (live data via ESPN)", ""]
     use_direct = bool(re.search(r"(?i)\b(next|upcoming|when|where|today|tonight|live|score|who won)\b", query))
+    event_label = "race" if is_racing else "match"
+    events_label = "races" if is_racing else "games"
+    today_label = "Today's races" if is_racing else "Today's games"
 
     if re.search(r"(?i)\bwho won\b", query) and finished:
         last = finished[-1]
@@ -740,10 +848,10 @@ def handle_espn_sports(query: str) -> HandlerResult | None:
             )
     elif upcoming:
         nxt = upcoming[0]
-        place = f"{nxt['venue']}, {nxt['city']}".strip(", ")
+        place = f"{nxt['venue']}, {nxt['city']}".strip(", ") or "TBD"
         lines.extend(
             [
-                f"**Next match:** {nxt['teams']}",
+                f"**Next {event_label}:** {nxt['teams']}",
                 f"- **When:** {_format_kickoff(nxt['kickoff'])}",
                 f"- **Where:** {place}",
             ]
@@ -752,10 +860,10 @@ def handle_espn_sports(query: str) -> HandlerResult | None:
         last = finished[-1]
         lines.append(f"**Latest result:** {last['scores']} ({last['status']})")
     else:
-        lines.append("No upcoming fixtures found in the next few days.")
+        lines.append(f"No upcoming {events_label} found in the next few months.")
 
     if today_events:
-        lines.extend(["", "**Today's games:**"])
+        lines.extend(["", f"**{today_label}:**"])
         for e in today_events:
             place = f"{e['venue']}, {e['city']}".strip(", ")
             lines.append(f"- {e['teams']} — {e['status']} — {place}")
@@ -828,10 +936,11 @@ def handle_wikipedia(query: str) -> HandlerResult | None:
 def handle_ddg_instant(query: str) -> HandlerResult | None:
     if WIKI_PATTERN.match(query.strip()):
         return None
-    if not re.search(r"(?i)^(who|what|when|where|how many|how much)\b", query.strip()):
+    if re.search(r"(?i)\b(draft|write|code|implement|refactor|debug)\b", query):
         return None
-    if re.search(r"(?i)\b(draft|write|code|explain|email|weather|price|score|schedule)\b", query):
-        return None
+    if not re.search(r"(?i)^(who|what|when|where|how many|how much|is|are|tell me)\b", query.strip()):
+        if not FACTUAL_QUERY_PATTERN.search(query):
+            return None
     hit = search_ddg_instant(query)
     if not hit:
         return None
@@ -898,7 +1007,7 @@ def build_web_context(query: str, *, force_search: bool = False) -> dict:
 
     now_line = _now_line()
     needs_verify = query_needs_verification(query)
-    include_reference = force_search or needs_verify
+    include_reference = True
     handler_out = run_handlers(query, include_reference=include_reference)
 
     fx_block = ""
@@ -921,14 +1030,12 @@ def build_web_context(query: str, *, force_search: bool = False) -> dict:
             pass
 
     results: list[dict] = []
-    run_scrape = force_search or needs_verify or (
-        query_needs_internet(query, force_search=force_search)
-        and not handler_out.direct_answer
-    )
+    has_direct = bool(handler_out.direct_answer and handler_out.use_direct)
+    run_scrape = force_search or needs_verify or not has_direct
     if run_scrape:
         search_query = refine_search_query(query)
         try:
-            results = search_duckduckgo(search_query, max_results=5)
+            results = search_duckduckgo(search_query, max_results=8)
             handler_out.sources.extend(results)
         except urllib.error.URLError as e:
             if not handler_out.context_blocks and not handler_out.direct_answer:

@@ -1,0 +1,2 @@
+# Optional — used when pdftotext (poppler) is not available. Installed automatically by setup.sh.
+pypdf>=4.0

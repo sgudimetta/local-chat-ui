@@ -2,24 +2,35 @@
 
 A simple ChatGPT-style chat app that runs entirely on your Mac. It uses **Ollama** for local AI and optional **web search** for live facts — exchange rates, weather, sports scores, crypto prices, and more.
 
-**No npm. No Docker. No API keys.** Python 3 (already on macOS) + Ollama only.
+**No npm. No Docker. No API keys.** Python 3 (already on macOS) + Ollama. Optional pip/Homebrew deps for PDF attachments are **installed automatically** by `./start.sh`.
 
 ---
 
 ## Quick start (5 minutes)
 
-If you already have Homebrew and Ollama:
+If you already have Homebrew:
 
 ```bash
 git clone https://github.com/sgudimetta/local-chat-ui.git ~/local-chat-ui
 cd ~/local-chat-ui
-chmod +x start.sh
+chmod +x start.sh setup.sh
 ./start.sh
 ```
+
+`./start.sh` will:
+
+1. Run **`setup.sh`** — check/install PDF support (`poppler` or `pypdf`), verify Ollama
+2. Start the chat server on port 8080
 
 Then open **http://127.0.0.1:8080** in Safari or Chrome.
 
 Keep the Terminal window open while you chat.
+
+To only check or install dependencies without starting the server:
+
+```bash
+./setup.sh
+```
 
 ---
 
@@ -46,7 +57,7 @@ Keep the Terminal window open while you chat.
 brew --version
 ```
 
-### Step 3 — Install Ollama
+### Step 3 — Install Ollama (or let setup do it)
 
 ```bash
 brew install ollama
@@ -54,6 +65,8 @@ brew services start ollama
 ```
 
 Or download from [ollama.com/download](https://ollama.com/download) and open the app once.
+
+**Or skip this step** — `./start.sh` runs `setup.sh`, which tries `brew install ollama` if Ollama is missing.
 
 Verify it works:
 
@@ -146,7 +159,7 @@ Try a few more live queries:
 - **Recent** list on the left — all saved chats, newest first (like Claude/Cowork)
 - Click any chat to switch; **×** on hover deletes it
 - Chat names auto-update from your first message
-- **All chats persist** across refresh and server restart (`data/chats.json` + browser backup)
+- **All chats persist** across refresh and server restart (outside the repo — see [Chat storage](#chat-storage) — plus browser backup)
 - On open/refresh you land on the **welcome screen** — your chats stay in the sidebar; click one to continue
 - Creating a new chat **never removes** existing chats
 - **Search chats** — filter the sidebar by title, instructions, or message text
@@ -177,10 +190,15 @@ Relevant files are gathered automatically from your question — no `@file` synt
 
 ### Attach files
 
-Click the **paperclip** to attach up to 5 files (512 KB each):
+Click the **paperclip** to attach up to 5 files (2 MB each):
 
-- **Any text-based file** — source code, config, logs, CSV, markdown, etc. (extension-agnostic; binary files like PDF/zip are skipped)
+- **Documents** — PDF, Word (`.doc`/`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), RTF
+- **Any text file** — source code, config, logs, CSV, markdown, JSON, YAML, etc.
 - **Images** — analyzed with a vision model when available
+
+**PDF support** is installed automatically on first `./start.sh` (`poppler` via Homebrew, or `pypdf` via pip). Word/Excel/PowerPoint use built-in parsers + macOS `textutil`.
+
+Unsupported: archives (zip), video/audio, executables.
 
 The model reads attached file contents and analyzes them in context. Ask e.g. *"Explain this code"* or *"Find bugs in the attached file."*
 
@@ -295,7 +313,7 @@ brew services stop ollama
 | Slow replies | Model too big for your RAM — try `llama3.2:1b` or enable **Fast responses** |
 | Mac sluggish after use | `ollama stop -a` then `brew services stop ollama` |
 | Web search fails | Check internet; corporate firewall may block DuckDuckGo or ESPN |
-| Chats missing after restart | Check `data/chats.json` exists; start the server from the same folder |
+| Chats missing after restart | Check the path printed at startup (`Chats saved to → …`); set `CHAT_UI_DATA_DIR` if you moved storage |
 | "+ New chat" not adding chats | Hard refresh the browser (`Cmd+Shift+R`) after updating |
 | UI looks broken (vertical text) | Hard refresh (`Cmd+Shift+R`) — fixed in latest version |
 | Git push blocked on work Mac | Push from a personal Mac or use GitHub web UI |
@@ -311,19 +329,57 @@ open http://127.0.0.1:8081
 
 ---
 
+## Dependencies (automatic)
+
+`./start.sh` always runs **`setup.sh`** first. It checks what’s installed and installs only what’s missing:
+
+| Dependency | Used for | Auto-install |
+|------------|----------|--------------|
+| **Python 3** | Server | Pre-installed on macOS |
+| **Ollama** | Local LLM | `brew install ollama` + start service |
+| **pypdf** (in `.venv`) or **poppler** | PDF attachments | venv + `pip install`, or `brew install poppler` |
+| **textutil** | Legacy `.doc` on macOS | Built-in |
+| **curl** | Web search, SSL fallback | Built-in |
+
+You do **not** need to run brew/pip manually. Clone the repo and run:
+
+```bash
+chmod +x start.sh setup.sh
+./start.sh
+```
+
+For agents (Claude, Cursor): *“Run `./start.sh` in local-chat-ui”* — setup is included.
+
+---
+
 ## Environment variables (optional)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CHAT_UI_PORT` | `8080` | Web UI port |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama API URL |
-| `CHAT_UI_DATA_DIR` | `./data` | Where `chats.json` is stored |
+| `CHAT_UI_DATA_DIR` | macOS: `~/Library/Application Support/local-chat-ui` · Linux: `~/.local/share/local-chat-ui` | Where `chats.json` is stored (outside the repo) |
 
 Example:
 
 ```bash
 CHAT_UI_PORT=8081 ./start.sh
+CHAT_UI_DATA_DIR="$HOME/Documents/my-chats" ./start.sh
 ```
+
+### Chat storage
+
+Chats are saved to **`chats.json` in a user-local folder**, not inside the git repo — so deleting or re-cloning the project does not wipe your history.
+
+| OS | Default path |
+|----|----------------|
+| **macOS** | `~/Library/Application Support/local-chat-ui/chats.json` |
+| **Linux** | `~/.local/share/local-chat-ui/chats.json` |
+| **Windows** | `%APPDATA%\local-chat-ui\chats.json` |
+
+On first run, if you have an old `local-chat-ui/data/chats.json` from a previous install, it is **migrated automatically**.
+
+The server prints the exact path at startup: `Chats saved to → …`
 
 ---
 
@@ -342,7 +398,7 @@ Local LLM model in RAM
 - **LLM inference** stays on your machine  
 - **Live facts** use free public APIs (ESPN, Open-Meteo, CoinGecko, etc.) — high-confidence answers skip the LLM entirely  
 - **Fallback search** uses DuckDuckGo when no dedicated handler matches  
-- **Chats** persist on disk in `data/chats.json`
+- **Chats** persist in `~/Library/Application Support/local-chat-ui/chats.json` (macOS) — see [Chat storage](#chat-storage)
 
 ---
 
@@ -351,11 +407,14 @@ Local LLM model in RAM
 ```
 local-chat-ui/
 ├── README.md
-├── start.sh           # Start script — run this
+├── start.sh           # Start server (runs setup.sh first)
+├── setup.sh           # Auto-check/install dependencies
+├── requirements.txt   # pip deps (pypdf) — installed into .venv by setup.sh
 ├── server.py          # Python server + Ollama proxy + chat persistence
+├── file_parser.py     # PDF / Office document text extraction
 ├── web_search.py      # Live data handlers (weather, sports, FX, crypto, …)
-├── data/
-│   └── chats.json     # Your conversations (created automatically, gitignored)
+├── agent.py           # Agent / Plan / Debug modes
+├── repo_tools.py      # Sandboxed project file access
 ├── .gitignore
 └── static/
     ├── index.html

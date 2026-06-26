@@ -94,13 +94,17 @@ let availableModels = [];
 /** @type {{ kind: 'image'|'file', name: string, dataUrl?: string, base64?: string, text?: string, truncated?: boolean }[]} */
 let pendingAttachments = [];
 
-const MAX_ATTACH_BYTES = 512 * 1024;
+const MAX_ATTACH_BYTES = 2 * 1024 * 1024;
 const MAX_ATTACH_TEXT_CHARS = 48_000;
 const MAX_ATTACH_COUNT = 5;
-/** Extensions we know are binary — everything else is attempted as text. */
+/** Extensions parsed on the server (PDF, Office, etc.) */
+const SERVER_PARSE_EXT = new Set([
+  ".pdf", ".doc", ".docx", ".rtf", ".odt",
+  ".xls", ".xlsx", ".ppt", ".pptx",
+]);
+/** Extensions blocked entirely — not readable */
 const BINARY_EXT = new Set([
   ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tar",
-  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
   ".exe", ".dll", ".dmg", ".pkg", ".deb", ".rpm", ".msi",
   ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac",
   ".wasm", ".bin", ".iso", ".img",
@@ -698,22 +702,38 @@ function saveChat() {
   saveChats();
 }
 
-/** Smart routing: only hit the internet for live/volatile facts — everyday Q&A stays with the LLM. */
+/** Web search ON → search by default for any non-creative query (ChatGPT-style). */
 const WEB_FORCE_PREFIX = /^\/search\s+/i;
+
+const WEB_EXPLICIT_SEARCH =
+  /\b(look up online|search the web|search online|find online|check online|google this)\b/i;
+
+/** Pure creative/code tasks — skip web even when toggle is on. */
+const WEB_LOCAL_CREATIVE =
+  /\b(draft|write|compose|rewrite|proofread|edit)\b.{0,40}\b(email|e-?mail|letter|essay|poem|story|blog|resume|cv|cover letter|thank you note)\b/i;
+
+const WEB_LOCAL_CODE =
+  /\b(fix my code|debug this|refactor this|implement (?:a |the )?(?:function|class|method|feature|api)|write (?:me )?(?:a )?(?:function|class|script|program|unit test)s?)\b/i;
+
+function isClearlyLocalCreative(text) {
+  const t = text.trim();
+  if (!t || /^\/(?:system|s)\b/i.test(t)) return true;
+  if (WEB_LOCAL_CREATIVE.test(t)) return true;
+  if (WEB_LOCAL_CODE.test(t)) return true;
+  return false;
+}
 
 const WEB_LIVE_REQUIRED =
   /\b(current|today'?s?|latest|right now|as of now|as of today|this week|this month|live\b|real[- ]?time)\b/i;
 
 const WEB_LIVE_TOPIC_PATTERNS = [
-  /\b(weather|forecast|temperature|rain|snow|humidity|wind speed)\b.*\b(today|tomorrow|now|this week|in\s+\w)/i,
-  /\b(weather|forecast)\s+(?:in|for|at)\s+/i,
+  /\b(weather|forecast|temperature|rain|snow|humidity|wind speed)\b/i,
   /\b(exchange rate|forex|fx|usd\s*to|eur\s*to|inr\s*to|gbp\s*to|dollar[s]?\s+to|rupee[s]?\s+to)\b/i,
   /\b(bitcoin|ethereum|crypto(?:currency)?|btc|eth|solana|dogecoin)\s*(price|cost|worth|rate)?\b/i,
   /\b(what time is it|time in\s+|time is it in\s+)\b/i,
-  /\b(who won|final score|game score|match score|live score)\b/i,
-  /\b(next\s+(?:game|match|fixture|world\s*cup)|upcoming\s+(?:game|match)|kick\s*off|kickoff)\b/i,
-  /\b(world\s*cup|worldcup|fifa|super\s*bowl|superbowl|playoffs?)\b.*\b(next|schedule|fixture|when|where|today|score)\b/i,
-  /\b(nfl|nba|mlb|epl|premier league|college football|cfb)\b.*\b(score|schedule|next|today|tonight|live|who won)\b/i,
+  /\b(who won|final score|game score|match score|live score|standings)\b/i,
+  /\b(next|upcoming|schedule|fixture|when is|where is)\b/i,
+  /\b(f1|formula\s*one|formula\s*1|grand\s*prix|nfl|nba|mlb|epl|premier league|world\s*cup|fifa)\b/i,
   /\b(stock price|share price|market cap)\b/i,
   /\b(breaking|headline|news today|news about)\b/i,
 ];
@@ -722,14 +742,8 @@ function matchesLiveTopics(text) {
   return WEB_LIVE_TOPIC_PATTERNS.some((p) => p.test(text));
 }
 
-const WEB_EXPLICIT_SEARCH =
-  /\b(look up online|search the web|search online|find online|check online|google this)\b/i;
-
 const WEB_LOCAL_ONLY =
-  /\b(explain|why\s+(?:is|are|do|does|did)|how\s+(?:do|does|can|to|would)|help me understand|what(?:'s| is) the difference|compare|pros and cons|advantages and disadvantages|draft|write|compose|rewrite|proofread|edit|email|e-?mail|letter|cover letter|resume|cv|essay|poem|story|blog|joke|funny|brainstorm|ideas? for|outline|summarize|summary|translate|debug|fix my|review my|teach me|walk me through|step by step|in my own words|roleplay|pretend|conversation about|chat about|recommend|suggest (?:some|a few|movies|books|restaurants))\b/i;
-
-const WEB_STATIC_KNOWLEDGE =
-  /\b(tallest|largest|biggest|smallest|longest|highest|deepest|capital of|population of|who invented|when was .+ (built|founded|born|released)|history of|meaning of|define |definition of|tell me about the (country|state|city|planet)|i want to explore|travel to|visit )\b/i;
+  /\b(explain|why\s+(?:is|are|do|does|did)|how\s+(?:do|does|can|to|would)|help me understand|what(?:'s| is) the difference|compare|pros and cons|advantages and disadvantages|teach me|walk me through|step by step|in my own words|roleplay|pretend|conversation about|chat about|recommend|suggest (?:some|a few|movies|books|restaurants))\b/i;
 
 function needsFactVerification(text) {
   const t = text.trim();
@@ -754,47 +768,17 @@ function needsLiveWebSearch(text) {
   if (!t) return false;
   if (WEB_FORCE_PREFIX.test(t)) return true;
   if (WEB_EXPLICIT_SEARCH.test(t)) return true;
-  if (WEB_LOCAL_ONLY.test(t)) return false;
-  if (WEB_STATIC_KNOWLEDGE.test(t) && !WEB_LIVE_REQUIRED.test(t)) return false;
-  if (WEB_LIVE_REQUIRED.test(t)) return true;
-  if (matchesLiveTopics(t)) return true;
-  return false;
+  if (isClearlyLocalCreative(t)) return false;
+  return true;
 }
 
 const WEB_CREATIVE_SKIP =
-  /\b(draft|write|compose|rewrite|proofread|edit|email|e-mail|letter|message to|subject line|cover letter|resume|cv|essay|poem|story|blog|tone|grammar|spelling|translate|summarize|summary|explain|teach me|help me (with|understand|draft|write)|create a|generate a|brainstorm|ideas for|outline|reply to|respond to|thank you note|make it (sound|shorter|longer)|in my own words|conversation|chat about|roleplay|pretend)\b/i;
-
-function recentThreadIsAnalytical(chat) {
-  if (!chat?.history?.length) return false;
-  const recent = chat.history
-    .slice(-8)
-    .map((m) => m.content)
-    .join(" ");
-  return WEB_LOCAL_ONLY.test(recent) || WEB_CREATIVE_SKIP.test(recent);
-}
+  /\b(draft|write|compose|rewrite|proofread|edit|email|e-?mail|letter|message to|subject line|cover letter|resume|cv|essay|poem|story|blog|tone|grammar|spelling|translate|summarize|summary|brainstorm|ideas for|outline|reply to|respond to|thank you note|make it (sound|shorter|longer)|in my own words|conversation|chat about|roleplay|pretend)\b/i;
 
 function shouldWebSearch(text) {
   if (!webSearchToggle?.checked) return false;
-  const chat = getActiveChat();
   const t = text.trim();
   if (!t) return false;
-
-  if (WEB_FORCE_PREFIX.test(t)) return true;
-  if (needsFactVerification(t)) return true;
-
-  if (WEB_LOCAL_ONLY.test(t) || WEB_CREATIVE_SKIP.test(t)) return false;
-
-  // Follow-ups in an analytical thread: only search if clearly live
-  if (chat?.history.length > 1) {
-    if (recentThreadIsAnalytical(chat)) {
-      return needsLiveWebSearch(t);
-    }
-    // Short follow-ups ("what about 2026?") — let the LLM use thread context
-    if (t.length < 60 && !WEB_LIVE_REQUIRED.test(t) && !matchesLiveTopics(t)) {
-      return false;
-    }
-  }
-
   return needsLiveWebSearch(t);
 }
 
@@ -809,19 +793,13 @@ function queryForWebSearch(text) {
 const DEFAULT_ASSISTANT_PROMPT =
   "You are a knowledgeable, careful assistant. Accuracy and clarity matter more than speed.\n\n" +
   "Before you answer (silently — do not show this planning):\n" +
-  "- Identify what the user is really asking and which context applies (framework, version, domain).\n" +
-  "- If a term is ambiguous, pick the most likely meaning from context or note the distinction briefly.\n" +
+  "- Identify what the user is really asking and which context applies.\n" +
   "- Outline the key points you will cover.\n\n" +
   "In your reply:\n" +
   "- Give only the final, polished answer — no visible brainstorming or 'let me think' preamble.\n" +
   "- Be specific and structured (short intro, then bullets or steps where helpful).\n" +
-  "- Omit generic filler and obvious boilerplate unless the user asked for it.\n" +
-  "- For code, keep examples minimal and directly relevant.\n" +
-  "- If uncertain, say so briefly rather than guessing.\n\n" +
-  "For version numbers, release dates, or 'latest/current' claims: if you are not given web "
-  "reference material, say your knowledge may be outdated and suggest the user enable web search.\n\n" +
-  "Answer from your own knowledge for explanations, writing, coding, advice, and comparisons. " +
-  "Do not tell the user to search the web or check external sites.";
+  "- If uncertain, say so briefly rather than guessing or telling the user to look elsewhere.\n\n" +
+  "Answer from your own knowledge for explanations, writing, coding, advice, and comparisons.";
 
 const ATTACHMENT_SYSTEM_PROMPT =
   "The user attached file(s). The FULL file contents are in their message below.\n\n" +
@@ -948,9 +926,35 @@ function fileExtension(name) {
 function isKnownBinaryFile(file) {
   const ext = fileExtension(file.name);
   if (BINARY_EXT.has(ext)) return true;
+  if (SERVER_PARSE_EXT.has(ext)) return false;
   if (file.type.startsWith("video/") || file.type.startsWith("audio/")) return true;
-  if (file.type === "application/pdf" || file.type === "application/zip") return true;
+  if (file.type === "application/zip") return true;
   return false;
+}
+
+function needsServerParse(file) {
+  return SERVER_PARSE_EXT.has(fileExtension(file.name));
+}
+
+async function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function parseFileOnServer(file) {
+  const data = await readFileAsBase64(file);
+  const res = await fetch("/api/parse", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: file.name, data }),
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(out.error || "Could not parse file");
+  return out;
 }
 
 function looksLikeBinaryText(text) {
@@ -1003,24 +1007,34 @@ async function addAttachmentFile(file) {
     }
   } else {
     if (isKnownBinaryFile(file)) {
-      alert(`"${file.name}" looks like a binary file and can't be read as text.\nImages are supported via the same attach button.`);
+      alert(`"${file.name}" is not a supported attachment type.`);
       return;
     }
     let text;
-    try {
-      text = await readFileAsText(file);
-    } catch {
-      alert(`Could not read "${file.name}" as text.`);
-      return;
-    }
-    if (looksLikeBinaryText(text)) {
-      alert(`"${file.name}" appears to be binary, not text.`);
-      return;
-    }
     let truncated = false;
-    if (text.length > MAX_ATTACH_TEXT_CHARS) {
-      text = text.slice(0, MAX_ATTACH_TEXT_CHARS);
-      truncated = true;
+    try {
+      if (needsServerParse(file)) {
+        const parsed = await parseFileOnServer(file);
+        text = parsed.text || "";
+        truncated = Boolean(parsed.truncated);
+      } else {
+        text = await readFileAsText(file);
+        if (looksLikeBinaryText(text)) {
+          alert(`"${file.name}" appears to be binary, not text.`);
+          return;
+        }
+        if (text.length > MAX_ATTACH_TEXT_CHARS) {
+          text = text.slice(0, MAX_ATTACH_TEXT_CHARS);
+          truncated = true;
+        }
+      }
+    } catch (e) {
+      alert(`Could not read "${file.name}": ${e.message || e}`);
+      return;
+    }
+    if (!text.trim()) {
+      alert(`No readable text found in "${file.name}".`);
+      return;
     }
     pendingAttachments.push({ kind: "file", name: file.name, text, truncated });
   }
@@ -1637,7 +1651,7 @@ function buildPayload() {
     stream: true,
     fast_mode: fastModeToggle?.checked ?? false,
     web_search: useWeb,
-    web_search_force: isForcedWebSearch(lastUser) || verify,
+    web_search_force: useWeb || isForcedWebSearch(lastUser) || verify,
     verify_facts: verify,
     web_search_query: useWeb ? queryForWebSearch(lastUser) : undefined,
   };

@@ -26,11 +26,43 @@ from repo_tools import (
     write_file,
 )
 from agent import run_agent
+from file_parser import extract_text
 
 OLLAMA_BASE = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 PORT = int(os.environ.get("CHAT_UI_PORT", "8080"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-DATA_DIR = Path(os.environ.get("CHAT_UI_DATA_DIR", Path(__file__).resolve().parent / "data"))
+LEGACY_DATA_DIR = Path(__file__).resolve().parent / "data"
+
+
+def default_data_dir() -> Path:
+    """User-local storage — survives repo delete/re-clone."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "local-chat-ui"
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "local-chat-ui"
+        return Path.home() / "local-chat-ui"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "local-chat-ui"
+
+
+def ensure_data_dir() -> Path:
+    data_dir = Path(os.environ.get("CHAT_UI_DATA_DIR", default_data_dir()))
+    data_dir.mkdir(parents=True, exist_ok=True)
+    chats_file = data_dir / "chats.json"
+    legacy_file = LEGACY_DATA_DIR / "chats.json"
+    if not chats_file.is_file() and legacy_file.is_file():
+        try:
+            chats_file.write_bytes(legacy_file.read_bytes())
+            print(f"Migrated chats → {chats_file}")
+        except OSError as e:
+            print(f"Warning: could not migrate legacy chats: {e}", file=sys.stderr)
+    return data_dir
+
+
+DATA_DIR = ensure_data_dir()
 CHATS_FILE = DATA_DIR / "chats.json"
 _http_server: ThreadingHTTPServer | None = None
 _chat_store_lock = threading.Lock()
@@ -191,6 +223,9 @@ class ChatHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/repo/write":
             self._repo_write()
             return
+        if self.path == "/api/parse":
+            self._parse_attachment()
+            return
         if self.path == "/api/unload":
             self._unload_models()
             return
@@ -321,6 +356,29 @@ class ChatHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _parse_attachment(self):
+        body = self._read_body()
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            self._json_response(400, {"error": "Invalid JSON"})
+            return
+        name = payload.get("name") or "file"
+        b64 = payload.get("data") or ""
+        if not b64:
+            self._json_response(400, {"error": "Missing data (base64)"})
+            return
+        try:
+            import base64
+
+            raw = base64.b64decode(b64)
+            result = extract_text(name, raw)
+            self._json_response(200, {"name": name, **result})
+        except ValueError as e:
+            self._json_response(400, {"error": str(e)})
+        except Exception as e:
+            self._json_response(500, {"error": f"Parse failed: {e}"})
 
     def _proxy_get(self, url: str):
         try:
@@ -542,8 +600,7 @@ class ChatHandler(SimpleHTTPRequestHandler):
             return payload, None
 
         verify_facts = verify_facts or query_needs_verification(last_user)
-        if verify_facts:
-            force_search = True
+        force_search = force_search or True
 
         result = build_web_context(last_user, force_search=force_search)
         context = result["context"]
@@ -566,32 +623,22 @@ class ChatHandler(SimpleHTTPRequestHandler):
         user_system = "\n\n".join(
             m["content"] for m in messages if m.get("role") == "system" and m.get("content")
         )
+        web_rules = (
+            "WEB SEARCH RESULTS are below. Answer like a top-tier assistant — direct, specific, complete.\n\n"
+            "Rules — follow strictly:\n"
+            "1. Use the reference material as your primary source. Training memory is secondary.\n"
+            "2. For dates, schedules, scores, prices, names, versions: take facts from the reference.\n"
+            "3. Give a polished answer in your own words — structured, no filler, no visible planning.\n"
+            "4. NEVER tell the user to check a website, enable search, or ask which season/year.\n"
+            "5. NEVER say you need more context if the reference contains the answer.\n"
+            "6. If the reference is thin, say what you found and what's uncertain — still answer fully.\n"
+        )
         if verify_facts:
-            web_part = (
-                "This question needs VERIFIED facts (versions, releases, dates, support status).\n\n"
-                "Rules — follow strictly:\n"
-                "1. Base version numbers, release dates, and any 'latest/current' claim ONLY on "
-                "the reference material below and its 'Today is …' line.\n"
-                "2. If your training memory disagrees with the reference, trust the reference.\n"
-                "3. If the reference is thin or conflicting, say you could not fully verify and "
-                "give only what the sources support — do NOT guess from memory.\n"
-                "4. Answer in your own words with a polished, structured reply.\n"
-                "5. Never tell the user to search elsewhere.\n\n"
-                f"{context}"
+            web_rules += (
+                "7. VERIFICATION MODE: version numbers, release dates, and 'latest/current' claims "
+                "must come ONLY from the reference and its 'Today is …' line — not from memory.\n"
             )
-        else:
-            web_part = (
-                "Reference material from the web is provided below. Use it thoughtfully:\n\n"
-                "1. Silently clarify what the user needs and how the reference material applies.\n"
-                "2. Answer in your own words with a polished, structured reply — no visible planning "
-                "or pasted search snippets.\n"
-                "3. Use the reference only for facts that must be current or verified "
-                "(numbers, dates, names, scores, rates).\n"
-                "4. For reasoning, comparison, or follow-ups, rely on your analysis and chat context.\n"
-                "5. If the reference is thin or conflicting, say so briefly and reason from what you know.\n"
-                "6. Never tell the user to check websites or search elsewhere.\n\n"
-                f"{context}"
-            )
+        web_part = f"{web_rules}\n{context}"
         combined_system = f"{user_system}\n\n{web_part}".strip() if user_system else web_part
         web_system = {"role": "system", "content": combined_system}
         out = [web_system]

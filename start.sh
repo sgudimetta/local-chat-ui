@@ -28,18 +28,13 @@ if port_in_use; then
   exit 1
 fi
 
-# Ensure Ollama is reachable
+# Auto-install / verify dependencies (PDF, Ollama, etc.)
+bash "$DIR/setup.sh"
+
 if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-  echo "Ollama is not running. Starting..."
-  if command -v brew >/dev/null; then
-    brew services start ollama 2>/dev/null || true
-    sleep 2
-  fi
-  if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-    echo "ERROR: Ollama still not reachable at http://127.0.0.1:11434"
-    echo "Run: brew services start ollama"
-    exit 1
-  fi
+  echo "ERROR: Ollama still not reachable at http://127.0.0.1:11434"
+  echo "Run ./setup.sh or: brew install ollama && brew services start ollama"
+  exit 1
 fi
 
 echo "Models available:"
@@ -54,4 +49,9 @@ echo "Open →  http://127.0.0.1:${PORT}"
 echo "Stop  →  click 'Stop server' in the UI, or Ctrl+C here"
 echo ""
 
-exec python3 "$DIR/server.py"
+PYTHON="$DIR/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+  PYTHON="python3"
+fi
+
+exec "$PYTHON" "$DIR/server.py"
