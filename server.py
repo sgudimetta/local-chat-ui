@@ -177,7 +177,10 @@ class ChatHandler(SimpleHTTPRequestHandler):
             self._proxy_get(f"{OLLAMA_BASE}/api/tags")
             return
         if self.path == "/api/health":
-            self._json_response(200, {"ok": True, "ollama": OLLAMA_BASE})
+            self._json_response(200, {"ok": True, "ollama": OLLAMA_BASE, "running": True})
+            return
+        if self.path == "/api/server/status":
+            self._server_status()
             return
         if self.path == "/api/system":
             self._json_response(200, {"ram_gb": system_ram_gb()})
@@ -232,6 +235,16 @@ class ChatHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/shutdown":
             self._shutdown_server()
             return
+        if self.path == "/api/server/start":
+            self._json_response(
+                503,
+                {
+                    "ok": False,
+                    "error": "Start server from the launcher (./start.sh). Worker-only mode.",
+                    "launcher": False,
+                },
+            )
+            return
         if self.path == "/api/warmup":
             self._warmup_model()
             return
@@ -269,6 +282,27 @@ class ChatHandler(SimpleHTTPRequestHandler):
         except OSError as e:
             self._json_response(500, {"error": f"Could not save chats: {e}"})
 
+    def _server_status(self):
+        ollama_ok = False
+        try:
+            with urllib.request.urlopen(f"{OLLAMA_BASE}/api/tags", timeout=3) as resp:
+                ollama_ok = resp.status == 200
+        except urllib.error.URLError:
+            pass
+        self._json_response(
+            200,
+            {
+                "ok": True,
+                "launcher": False,
+                "running": True,
+                "launcher_port": PORT,
+                "worker_port": PORT,
+                "url": f"http://127.0.0.1:{PORT}",
+                "ollama": OLLAMA_BASE,
+                "ollama_ok": ollama_ok,
+            },
+        )
+
     def _unload_models(self):
         try:
             unloaded = unload_ollama_models()
@@ -286,7 +320,7 @@ class ChatHandler(SimpleHTTPRequestHandler):
         self._json_response(200, {
             "ok": True,
             "unloaded": unloaded,
-            "message": "Server stopping. Run ./start.sh to start again.",
+            "message": "Worker stopping.",
         })
         schedule_server_shutdown()
 

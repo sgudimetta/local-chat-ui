@@ -510,6 +510,29 @@ html, body {
   cursor: not-allowed;
 }
 
+.btn-start {
+  width: 100%;
+  background: transparent;
+  border: 1px solid #3f7f5f;
+  color: #86efac;
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 0.875rem;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.btn-start:hover:not(:disabled) {
+  background: #1f3f2f;
+  border-color: #86efac;
+}
+
+.welcome-sub {
+  font-size: 0.875rem;
+  color: var(--muted, #888);
+  margin-top: 8px;
+}
+
 .footer-hint {
   font-size: 0.7rem;
   line-height: 1.4;

@@ -20,11 +20,11 @@ chmod +x start.sh setup.sh
 `./start.sh` will:
 
 1. Run **`setup.sh`** — check/install PDF support (`poppler` or `pypdf`), verify Ollama
-2. Start the chat server on port 8080
+2. Start the **launcher** on port 8080 (always-on control plane)
 
 Then open **http://127.0.0.1:8080** in Safari or Chrome.
 
-Keep the Terminal window open while you chat.
+Run `./start.sh` once per Mac session (or after a reboot). After that, use **Stop server** / **Start server** in the sidebar — no Terminal needed to pause or resume chat.
 
 To only check or install dependencies without starting the server:
 
@@ -270,9 +270,12 @@ Settings are saved in your browser (`localStorage`).
 
 | Action | How |
 |--------|-----|
-| Stop chat server | **Stop server** button in sidebar, or `Ctrl+C` in Terminal |
-| Free model RAM | `ollama stop -a` |
+| Stop chat worker (free RAM) | **Stop server** in sidebar — page stays open; click **Start server** to resume |
+| Stop launcher entirely | `Ctrl+C` in the Terminal where `./start.sh` is running |
+| Free model RAM manually | `ollama stop -a` |
 | Stop Ollama entirely | `brew services stop ollama` |
+
+The launcher keeps port **8080** open so the UI always loads. Stop/Start only controls the chat **worker** (ports 18080–18100). If a worker port is busy, start automatically tries the next free port.
 
 ---
 
@@ -288,10 +291,7 @@ open http://127.0.0.1:8080
 
 **Stop (light — may chat again later):**
 
-```bash
-Ctrl+C                             # stop chat UI
-ollama stop llama3.1:8b            # free model RAM (use your model name)
-```
+Click **Stop server** in the sidebar (or `Ctrl+C` in Terminal to quit the launcher entirely). Your chats stay saved; click **Start server** to chat again — no Terminal command needed.
 
 **Stop (full — done for the day):**
 
@@ -388,7 +388,9 @@ The server prints the exact path at startup: `Chats saved to → …`
 ```
 Browser (localhost:8080)
     ↓
-server.py  — serves UI + proxies to Ollama + live data handlers
+launcher.py  — always-on UI + Stop/Start control; proxies API to worker
+    ↓
+server.py (worker, ports 18080–18100)  — chat, Ollama proxy, web search
     ↓                    ↓
 Ollama (localhost:11434)  Internet (web search / live APIs, if enabled)
     ↓
@@ -407,10 +409,11 @@ Local LLM model in RAM
 ```
 local-chat-ui/
 ├── README.md
-├── start.sh           # Start server (runs setup.sh first)
+├── start.sh           # Start launcher (runs setup.sh first)
 ├── setup.sh           # Auto-check/install dependencies
 ├── requirements.txt   # pip deps (pypdf) — installed into .venv by setup.sh
-├── server.py          # Python server + Ollama proxy + chat persistence
+├── launcher.py        # Control plane on :8080; spawns/stops server.py worker
+├── server.py          # Chat worker + Ollama proxy + chat persistence
 ├── file_parser.py     # PDF / Office document text extraction
 ├── web_search.py      # Live data handlers (weather, sports, FX, crypto, …)
 ├── agent.py           # Agent / Plan / Debug modes

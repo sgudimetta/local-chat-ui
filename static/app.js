@@ -1335,22 +1335,179 @@ async function warmModel() {
   }
 }
 
-async function stopServer() {
-  if (!confirm("Stop the chat server and free model RAM?\n\nStart again later with: ./start.sh")) {
-    return;
+let serverRunning = true;
+let serverActionInProgress = false;
+let serverPollTimer = null;
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchServerStatus() {
+  try {
+    const res = await fetch("/api/server/status", { cache: "no-store" });
+    if (!res.ok) return { running: false };
+    return await res.json();
+  } catch {
+    return { running: false };
   }
-  stopBtn.disabled = true;
-  stopBtn.textContent = "Stopping…";
-  userInput.disabled = true;
-  sendBtn.disabled = true;
+}
+
+async function waitForServerState(running, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const st = await fetchServerStatus();
+    if (Boolean(st.running) === running) return st;
+    await sleep(350);
+  }
+  return fetchServerStatus();
+}
+
+function setComposerEnabled(on) {
+  const allow = on && serverRunning;
+  if (!streaming) {
+    userInput.disabled = !allow;
+    sendBtn.disabled = !allow || !modelSelect.value;
+  }
+  if (attachBtn) attachBtn.disabled = !allow;
+  if (modelSelect) modelSelect.disabled = !allow;
+  if (newChatBtn) newChatBtn.disabled = !allow;
+}
+
+function showStoppedWelcome() {
   messagesEl.innerHTML = `
     <div class="welcome">
       <h1>Server stopped</h1>
-      <p>Model RAM freed. To chat again, run in Terminal:</p>
-      <p><code>cd ~/local-chat-ui && ./start.sh</code></p>
+      <p>Model RAM freed. Click <strong>Start server</strong> in the sidebar to chat again.</p>
+      <p class="welcome-sub">Your chats are saved in the sidebar.</p>
     </div>
   `;
-  setStatus(false, "Server stopped");
+}
+
+function applyServerUi(running) {
+  serverRunning = running;
+  if (!stopBtn) return;
+  stopBtn.disabled = serverActionInProgress;
+  stopBtn.classList.toggle("btn-start", !running);
+  stopBtn.classList.toggle("btn-stop", running);
+  stopBtn.textContent = running ? "Stop server" : "Start server";
+  stopBtn.title = running
+    ? "Stop chat worker and free model RAM"
+    : "Start chat worker (auto-frees port if needed)";
+  const footerHint = document.getElementById("footer-hint");
+  if (footerHint) {
+    footerHint.textContent = running
+      ? "Stop frees model RAM · this page stays open"
+      : "Start server to chat again — no Terminal needed";
+  }
+  setComposerEnabled(running);
+  if (!running && !streaming) {
+    if (getActiveChat()?.history?.length) {
+      renderMessages();
+    } else {
+      showStoppedWelcome();
+    }
+  }
+}
+
+async function refreshServerStatus() {
+  const st = await fetchServerStatus();
+  applyServerUi(Boolean(st.running));
+  if (st.running) {
+    setStatus(Boolean(st.ollama_ok), st.ollama_ok ? "Connected" : "Ollama offline");
+  } else {
+    setStatus(false, "Server stopped");
+  }
+  return st;
+}
+
+function scheduleServerPoll() {
+  clearInterval(serverPollTimer);
+  serverPollTimer = setInterval(() => {
+    if (serverActionInProgress) return;
+    fetchServerStatus().then((st) => {
+      if (Boolean(st.running) !== serverRunning) {
+        applyServerUi(Boolean(st.running));
+        if (st.running) {
+          loadModels();
+          renderMessages();
+        }
+      }
+    });
+  }, 5000);
+}
+
+async function toggleServer() {
+  if (serverActionInProgress) return;
+  if (serverRunning) await stopServer();
+  else await startServer();
+}
+
+async function stopServer() {
+  if (
+    !confirm(
+      "Stop the chat worker and free model RAM?\n\nYou can start again with the Start server button — no Terminal needed.",
+    )
+  ) {
+    return;
+  }
+  serverActionInProgress = true;
+  stopBtn.disabled = true;
+  stopBtn.textContent = "Stopping…";
+  streamAbort?.abort();
+  streaming = false;
+  setComposerStreaming(false);
+  try {
+    await fetch("/api/shutdown", {
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    await waitForServerState(false, 12000);
+    applyServerUi(false);
+    setStatus(false, "Server stopped");
+  } catch (e) {
+    alert(`Stop failed: ${e.message || e}`);
+    await refreshServerStatus();
+  } finally {
+    serverActionInProgress = false;
+    applyServerUi(serverRunning);
+  }
+}
+
+async function startServer() {
+  serverActionInProgress = true;
+  stopBtn.disabled = true;
+  stopBtn.textContent = "Starting…";
+  setStatus(false, "Starting server…");
+  try {
+    const res = await fetch("/api/server/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) {
+      throw new Error(data.error || "Could not start server");
+    }
+    const st = await waitForServerState(true, 25000);
+    if (!st.running) {
+      throw new Error("Server did not become ready in time");
+    }
+    applyServerUi(true);
+    clearWelcome();
+    renderMessages();
+    await loadModels();
+    setStatus(true, `Connected · ${modelSelect.value || "ready"}`);
+  } catch (e) {
+    alert(`Start failed: ${e.message || e}`);
+    applyServerUi(false);
+    setStatus(false, "Server stopped");
+  } finally {
+    serverActionInProgress = false;
+    applyServerUi(serverRunning);
+  }
 }
 
 async function unloadModels() {
@@ -1438,6 +1595,10 @@ function createAssistantPlaceholder(useWeb, forced, verify) {
 }
 
 async function loadModels() {
+  if (!serverRunning) {
+    modelSelect.innerHTML = '<option value="">Server stopped</option>';
+    return;
+  }
   try {
     const [modelsRes, systemRes] = await Promise.all([
       fetch("/api/models"),
@@ -1614,10 +1775,14 @@ function finalizeAssistantMessage(wrap, contentEl, content, { stopped = false } 
 }
 
 function setComposerStreaming(active) {
-  sendBtn.disabled = false;
   sendBtn.classList.toggle("is-streaming", active);
   sendBtn.setAttribute("aria-label", active ? "Stop generating" : "Send");
-  userInput.disabled = active;
+  if (active) {
+    sendBtn.disabled = false;
+    userInput.disabled = true;
+    return;
+  }
+  setComposerEnabled(serverRunning);
 }
 
 function stopGeneration() {
@@ -1665,6 +1830,10 @@ function buildPayload() {
 async function sendMessage(text, { regenerate = false } = {}) {
   const trimmed = text.trim();
   const attached = hasAttachments();
+  if (!serverRunning) {
+    alert("Server is stopped. Click Start server in the sidebar.");
+    return;
+  }
   if ((!trimmed && !attached) || streaming || !modelSelect.value) return;
 
   let chat = getActiveChat();
@@ -1946,7 +2115,7 @@ chatSearchInput?.addEventListener("input", () => {
 });
 
 newChatBtn?.addEventListener("click", newChat);
-stopBtn.addEventListener("click", stopServer);
+stopBtn.addEventListener("click", toggleServer);
 
 webSearchToggle.addEventListener("change", saveSettings);
 fastModeToggle.addEventListener("change", () => {
@@ -2021,6 +2190,8 @@ async function bootstrap() {
   loadSettings();
   setChatMode(chatMode);
   await loadChats();
+  await refreshServerStatus();
+  scheduleServerPoll();
   await loadRepoRoot();
   if (repoPathInput?.value?.trim() && !repoRoot) {
     try {
@@ -2033,7 +2204,9 @@ async function bootstrap() {
   renderMessages();
   updateComposerPlaceholder();
   bindSuggestions();
-  loadModels();
+  if (serverRunning) {
+    loadModels();
+  }
 }
 
 bootstrap();
