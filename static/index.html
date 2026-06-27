@@ -8,7 +8,7 @@
 </head>
 <body>
   <div class="app">
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       <div class="sidebar-header">
         <div class="logo">Local Chat</div>
         <button type="button" id="new-chat" class="btn-new" title="New conversation">+ New chat</button>
@@ -65,10 +65,10 @@
           </label>
           <p class="toggle-hint">Keep models in RAM for 2–5 min instead of 30 — essential on 8 GB Macs sharing RAM with Cursor</p>
           <label class="toggle-row">
-            <input type="checkbox" id="auto-unload-pressure" checked />
+            <input type="checkbox" id="auto-unload-pressure" />
             <span>Auto-free RAM when system is choking</span>
           </label>
-          <p class="toggle-hint">Unloads the model if memory pressure gets critical (Ollama stays running)</p>
+          <p class="toggle-hint">Optional — only auto-unloads on 8 GB Macs when memory is critically low</p>
           <label class="toggle-row">
             <input type="checkbox" id="auto-unload-idle" />
             <span>Auto-free RAM after 10 min idle</span>
@@ -102,6 +102,7 @@
         <p id="footer-hint" class="footer-hint">Stop unloads model RAM · Ollama app keeps running</p>
       </div>
     </aside>
+    <div class="sidebar-resizer" id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
 
     <main class="main">
       <div id="messages" class="messages">

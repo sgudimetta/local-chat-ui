@@ -7,10 +7,13 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
 OLLAMA_BASE = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+_PRESSURE_CACHE: tuple[float, float | None] = (0.0, None)
+_PRESSURE_CACHE_TTL = 45.0
 
 
 def _run(cmd: list[str], timeout: int = 5) -> str | None:
@@ -69,13 +72,19 @@ def _vm_stat_pages() -> dict[str, int]:
 
 
 def _memory_pressure_free_pct() -> float | None:
+    global _PRESSURE_CACHE
+    now = time.monotonic()
+    if now - _PRESSURE_CACHE[0] < _PRESSURE_CACHE_TTL:
+        return _PRESSURE_CACHE[1]
+
     text = _run(["memory_pressure"]) if sys.platform == "darwin" else None
-    if not text:
-        return None
-    m = re.search(r"free percentage:\s*(\d+)%", text, re.I)
-    if m:
-        return float(m.group(1))
-    return None
+    result: float | None = None
+    if text:
+        m = re.search(r"free percentage:\s*(\d+)%", text, re.I)
+        if m:
+            result = float(m.group(1))
+    _PRESSURE_CACHE = (now, result)
+    return result
 
 
 def memory_snapshot() -> dict:
@@ -99,7 +108,6 @@ def memory_snapshot() -> dict:
 
     pressure_free = _memory_pressure_free_pct()
     if pressure_free is not None and total:
-        # macOS reports system-wide free % — derive used when vm_stat unavailable
         if used_pct is None:
             used_pct = round(100 - pressure_free, 1)
             used_gb = total * used_pct / 100
@@ -143,8 +151,6 @@ def _ram_tier(total_gb: float | None) -> str:
         return "normal"
     if total_gb <= 8.5:
         return "tiny"
-    if total_gb <= 16.5:
-        return "low"
     return "normal"
 
 
@@ -155,32 +161,28 @@ def assess_pressure(mem: dict, ollama_vram_gb: float) -> dict:
     pressure_free = mem.get("pressure_free_pct")
     tier = _ram_tier(total)
 
-    # Stricter thresholds on 8 GB and 16 GB Macs (Cursor + Ollama share RAM)
     if tier == "tiny":
-        model_frac_warn, used_warn, used_crit = 0.32, 72, 82
-        free_crit, pressure_crit = 0.7, 24
-    elif tier == "low":
-        model_frac_warn, used_warn, used_crit = 0.40, 78, 88
-        free_crit, pressure_crit = 1.0, 20
+        model_frac_warn, used_warn, used_crit = 0.35, 75, 85
+        free_crit, pressure_crit = 0.6, 18
     else:
-        model_frac_warn, used_warn, used_crit = 0.45, 82, 90
-        free_crit, pressure_crit = 1.2, 18
+        model_frac_warn, used_warn, used_crit = 0.55, 88, 94
+        free_crit, pressure_crit = 0.5, 12
 
     level = "normal"
     message = "Memory looks fine."
     should_unload = False
-    tier_note = f" ({int(total)} GB Mac)" if tier != "normal" and total else ""
+    tier_note = f" ({int(total)} GB Mac)" if tier == "tiny" and total else ""
 
     if total and ollama_vram_gb >= total * model_frac_warn:
         level = "warn"
         message = (
             f"Model using ~{ollama_vram_gb:.1f} GB of {total:.0f} GB RAM{tier_note} — "
-            "Cursor may feel sluggish."
+            "use Free model RAM if Cursor feels slow."
         )
 
     if used_pct is not None and used_pct >= used_warn:
         level = "warn"
-        message = f"System RAM ~{used_pct:.0f}% used{tier_note} — consider freeing the model."
+        message = f"System RAM ~{used_pct:.0f}% used{tier_note}."
 
     if pressure_free is not None and pressure_free <= pressure_crit:
         level = "critical"
@@ -189,12 +191,12 @@ def assess_pressure(mem: dict, ollama_vram_gb: float) -> dict:
 
     if used_pct is not None and used_pct >= used_crit:
         level = "critical"
-        message = f"System RAM ~{used_pct:.0f}% full{tier_note} — free model RAM for Cursor."
+        message = f"System RAM ~{used_pct:.0f}% full{tier_note} — free model RAM."
         should_unload = True
 
-    if free_gb is not None and free_gb < free_crit and ollama_vram_gb > 0:
+    if free_gb is not None and free_gb < free_crit and ollama_vram_gb > 0 and tier == "tiny":
         level = "critical"
-        message = f"Only ~{free_gb:.1f} GB free with model loaded{tier_note} — system may choke."
+        message = f"Only ~{free_gb:.1f} GB free with model loaded{tier_note}."
         should_unload = True
 
     return {"level": level, "message": message, "should_unload": should_unload, "ram_tier": tier}

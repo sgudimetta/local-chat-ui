@@ -138,11 +138,76 @@ LOCAL_ONLY_PATTERN = re.compile(
     r"brainstorm|summarize|summary|translate|debug|teach me|walk me through|recommend|suggest)\b"
 )
 
+CONVERSATIONAL_ONLY_PATTERN = re.compile(
+    r"(?i)^(?:"
+    r"(?:thanks?(?:\s+(?:a\s+lot|so\s+much|very\s+much))?|thank\s+you(?:\s+so\s+much|\s+very\s+much)?|"
+    r"thx|ty|cheers|much\s+appreciated|appreciate\s+it)|"
+    r"(?:that(?:'s| is)\s+(?:helpful|great|perfect|awesome|good|useful))|"
+    r"(?:ok(?:ay)?|k|cool|nice|great|perfect|got\s+it|understood|makes\s+sense|sounds\s+good|"
+    r"will\s+do|noted|awesome|lovely|brilliant)|"
+    r"(?:hello|hi|hey|yo|good\s+(?:morning|afternoon|evening|night))|"
+    r"(?:how\s+(?:are\s+you|you\s+doing|goes\s+it))|"
+    r"(?:bye|goodbye|see\s+(?:you|ya)|take\s+care|later)|"
+    r"(?:yes|no|yep|nope|sure)|"
+    r"(?:can\s+you\s+)?(?:elaborate|explain\s+more|tell\s+me\s+more|go\s+on|continue|more\s+detail|"
+    r"expand(?:\s+on\s+that)?|say\s+more)"
+    r")(?:[!.?\s,]*)*$"
+)
+
 FACTUAL_QUERY_PATTERN = re.compile(
-    r"(?i)\b(who|what|when|where|which|how many|how much|tell me)\b|"
+    r"(?i)\b(who|what|when|where|which|how many|how much|tell me|give me)\b|"
     r"\b(when is|what is|what's|who is|who's|where is|how old|next|upcoming|"
     r"latest|current|today|tonight|schedule|fixture|price|cost|score|standings|"
-    r"release date|who won|how tall|population of|capital of)\b"
+    r"release date|who won|how tall|population of|capital of)\b|"
+    r"\b(odi|test|t20(?:i)?|first[- ]class|list a)\b.*\b(stats|statistics|runs|average|centuries|record)\b|"
+    r"\b(stats|statistics|batting|bowling)\b.*\b(odi|test|t20(?:i)?|cricket)\b"
+)
+
+CRICKET_FORMAT_ALIASES = {
+    "test": "test",
+    "tests": "test",
+    "odi": "odi",
+    "odis": "odi",
+    "one day": "odi",
+    "one-day": "odi",
+    "t20": "t20i",
+    "t20i": "t20i",
+    "twenty20": "t20i",
+    "fc": "fc",
+    "first class": "fc",
+    "first-class": "fc",
+    "firstclass": "fc",
+    "la": "la",
+    "list a": "la",
+    "list-a": "la",
+}
+
+CRICKET_FORMAT_SUFFIX = {
+    "test": "1",
+    "odi": "2",
+    "fc": "3",
+    "la": "4",
+}
+
+CRICKET_FORMAT_LABEL = {
+    "test": "Test",
+    "odi": "ODI",
+    "fc": "First-class",
+    "la": "List A",
+    "t20i": "T20I",
+}
+
+CRICKET_STATS_QUERY = re.compile(
+    r"(?i)(?:"
+    r"(?:give me\s+)?(test|odi|odis|t20(?:i)?|first[- ]?class|fc|list[- ]?a)\s+"
+    r"(?:stats|statistics|batting(?: stats)?|bowling(?: stats)?|career(?: stats)?|numbers?|record)\s+"
+    r"(?:of|for)\s+(.+?)(?:\?|$)"
+    r"|(.+?)(?:'s|')\s+(test|odi|odis|t20(?:i)?|first[- ]?class|fc|list[- ]?a)\s+"
+    r"(?:stats|statistics|batting|bowling|career|average|runs|record)"
+    r"|(test|odi|odis|t20(?:i)?|first[- ]?class|fc|list[- ]?a)\s+stats?\s+(?:of|for)\s+(.+?)(?:\?|$)"
+    r"|how many\s+(test|odi|odis|t20(?:i)?)\s+(?:runs|centuries|matches|wickets)\s+"
+    r"(?:did|has|have)\s+(.+?)(?:\s+(?:score|get|take))?(?:\?|$)"
+    r")"
 )
 
 LIVE_REQUIRED_PATTERN = re.compile(
@@ -185,17 +250,54 @@ def query_needs_verification(query: str) -> bool:
     return bool(VERIFY_FACTS_PATTERN.search(q))
 
 
-def query_needs_internet(query: str, *, force_search: bool = False) -> bool:
-    if force_search:
-        return True
+def query_is_conversational(query: str) -> bool:
+    """Thanks, greetings, brief acks — reply from chat context, not the web."""
     q = FORCE_SEARCH_PREFIX.sub("", query).strip()
-    if LOCAL_ONLY_PATTERN.search(q) and not FACTUAL_QUERY_PATTERN.search(q):
+    if not q or len(q) > 120:
         return False
+    if CONVERSATIONAL_ONLY_PATTERN.match(q):
+        return True
+    if len(q) <= 20 and "?" not in q and not query_looks_factual(q):
+        if LOCAL_ONLY_PATTERN.search(q):
+            return False
+        if not re.search(r"(?i)\b(who|what|when|where|why|how|which)\b", q):
+            return bool(re.match(r"^[\w\s'\".,!-]+$", q))
+    return False
+
+
+def query_looks_factual(query: str) -> bool:
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip()
+    if not q:
+        return False
+    if FORCE_SEARCH_PREFIX.search(query) or re.search(
+        r"(?i)\b(look up online|search the web|search online|find online|check online|google this)\b", q
+    ):
+        return True
     if query_needs_verification(q):
         return True
     if FACTUAL_QUERY_PATTERN.search(q):
         return True
-    return bool(LIVE_REQUIRED_PATTERN.search(q))
+    if LIVE_REQUIRED_PATTERN.search(q):
+        return True
+    if re.search(
+        r"(?i)\b(weather|forecast|price|score|population|capital|exchange rate|who won|headline|news today)\b",
+        q,
+    ):
+        return True
+    if q.endswith("?") and not LOCAL_ONLY_PATTERN.search(q):
+        return True
+    return False
+
+
+def query_needs_internet(query: str, *, force_search: bool = False) -> bool:
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip()
+    if query_is_conversational(q):
+        return False
+    if LOCAL_ONLY_PATTERN.search(q) and not query_looks_factual(q):
+        return False
+    if force_search and query_looks_factual(q):
+        return True
+    return query_looks_factual(q)
 
 _response_cache: dict[str, tuple[float, dict]] = {}
 
@@ -1146,6 +1248,287 @@ def handle_espn_sports(query: str) -> HandlerResult | None:
     )
 
 
+def _clean_wiki_field(value: str) -> str:
+    text = unescape(value.strip())
+    text = re.sub(r"\{\{[^}]+\}\}", "", text)
+    text = re.sub(r"\[\[(?:[^|\]]+\|)?([^\]]+)\]\]", r"\1", text)
+    text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.S)
+    text = re.sub(r"<ref[^/]*/>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_cricket_format(raw: str) -> str | None:
+    key = re.sub(r"\s+", " ", raw.strip().lower())
+    return CRICKET_FORMAT_ALIASES.get(key)
+
+
+def _parse_cricket_stats_query(query: str) -> tuple[str, str] | None:
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip().rstrip("?").strip()
+    m = CRICKET_STATS_QUERY.search(q)
+    if not m:
+        return None
+    g = m.groups()
+    if g[0] and g[1]:
+        fmt, player = g[0], g[1]
+    elif g[2] and g[3]:
+        player, fmt = g[2], g[3]
+    elif g[4] and g[5]:
+        fmt, player = g[4], g[5]
+    elif g[6] and g[7]:
+        fmt, player = g[6], g[7]
+    else:
+        return None
+    fmt = _normalize_cricket_format(fmt)
+    if not fmt:
+        return None
+    player = re.sub(r"\s+", " ", player).strip(" '\"")
+    player = re.sub(r"(?i)\b(batting|bowling|career|stats|statistics|record)\b", "", player).strip()
+    if len(player) < 3:
+        return None
+    return fmt, player
+
+
+def _fetch_wikipedia_wikitext(title: str) -> tuple[str, str] | None:
+    url = (
+        "https://en.wikipedia.org/w/api.php"
+        f"?action=parse&page={quote(title.replace(' ', '_'))}&prop=wikitext&redirects=1&format=json"
+    )
+    try:
+        data = _fetch_json(url)
+    except (urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return None
+    parse = data.get("parse") or {}
+    wikitext = (parse.get("wikitext") or {}).get("*") or ""
+    if not wikitext:
+        return None
+    page_title = parse.get("title") or title
+    wiki_url = f"https://en.wikipedia.org/wiki/{quote(page_title.replace(' ', '_'))}"
+    return wikitext, wiki_url
+
+
+def _find_cricket_infobox(wikitext: str) -> str:
+    for marker in ("{{Infobox cricketer", "{{Infobox cricket player"):
+        start = wikitext.find(marker)
+        if start >= 0:
+            depth = 0
+            i = start
+            while i < len(wikitext) - 1:
+                if wikitext[i : i + 2] == "{{":
+                    depth += 1
+                    i += 2
+                    continue
+                if wikitext[i : i + 2] == "}}":
+                    depth -= 1
+                    i += 2
+                    if depth == 0:
+                        return wikitext[start:i]
+                    continue
+                i += 1
+    return ""
+
+
+def _infobox_field(infobox: str, field: str) -> str | None:
+    m = re.search(rf"\|\s*{re.escape(field)}\s*=\s*([^\n|]+)", infobox, re.I)
+    if not m:
+        return None
+    val = _clean_wiki_field(m.group(1))
+    return val or None
+
+
+def _espn_search_cricket_player(name: str) -> dict | None:
+    url = (
+        "https://site.api.espn.com/apis/search/v2"
+        f"?query={quote(name)}&limit=5&type=player"
+    )
+    try:
+        data = _fetch_json(url)
+    except (urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return None
+    for block in data.get("results") or []:
+        if block.get("type") != "player":
+            continue
+        for item in block.get("contents") or []:
+            if item.get("sport") != "cricket":
+                continue
+            display = (item.get("displayName") or "").strip()
+            if not display:
+                continue
+            link = (item.get("link") or {}).get("web") or ""
+            return {"name": display, "url": link}
+    return None
+
+
+def _resolve_cricket_player_page(player: str) -> tuple[str, str, str] | None:
+    """Return (display_name, wikipedia_title, profile_url)."""
+    espn = _espn_search_cricket_player(player)
+    search_name = espn["name"] if espn else player
+    profile_url = espn["url"] if espn else ""
+    search_url = (
+        "https://en.wikipedia.org/w/api.php"
+        f"?action=query&list=search&srsearch={quote(search_name)}&format=json&srlimit=5"
+    )
+    try:
+        search = _fetch_json(search_url)
+    except (urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return None
+    player_lower = search_name.lower()
+    for hit in search.get("query", {}).get("search") or []:
+        title = (hit.get("title") or "").strip()
+        if not title:
+            continue
+        if player_lower.split()[0] in title.lower():
+            return search_name, title, profile_url
+    hits = search.get("query", {}).get("search") or []
+    if hits:
+        return search_name, hits[0]["title"], profile_url
+    return None
+
+
+def _format_cricket_stats_answer(
+    player: str,
+    fmt: str,
+    infobox: str,
+    *,
+    wiki_url: str,
+    profile_url: str,
+) -> str | None:
+    label = CRICKET_FORMAT_LABEL.get(fmt, fmt.upper())
+    if fmt == "t20i":
+        cap = _infobox_field(infobox, "T20Icap") or _infobox_field(infobox, "t20icap")
+        if not cap:
+            return None
+        lines = [f"**{player} — {label} career statistics**", ""]
+        lines.append(f"- **Matches:** {cap}")
+        debut = " ".join(
+            x
+            for x in (
+                _infobox_field(infobox, "T20Idebutdate") or _infobox_field(infobox, "t20idebutdate"),
+                _infobox_field(infobox, "T20Idebutyear") or _infobox_field(infobox, "t20idebutyear"),
+            )
+            if x
+        )
+        against = _infobox_field(infobox, "T20Idebutagainst") or _infobox_field(infobox, "t20idebutagainst")
+        if debut:
+            lines.append(f"- **Debut:** {debut}" + (f" vs {against}" if against else ""))
+        lines.append("")
+        lines.append(
+            "Detailed T20I batting/bowling numbers are not in the Wikipedia infobox; "
+            f"see the full profile on ESPNcricinfo."
+        )
+    else:
+        suffix = CRICKET_FORMAT_SUFFIX[fmt]
+        matches = _infobox_field(infobox, f"matches{suffix}")
+        runs = _infobox_field(infobox, f"runs{suffix}")
+        if not matches and not runs:
+            return None
+        lines = [f"**{player} — {label} career statistics**", ""]
+        if matches:
+            lines.append(f"- **Matches:** {matches}")
+        if runs:
+            lines.append(f"- **Runs:** {runs}")
+        avg = _infobox_field(infobox, f"bat avg{suffix}")
+        if avg:
+            lines.append(f"- **Batting average:** {avg}")
+        hs = _infobox_field(infobox, f"100s/50s{suffix}")
+        if hs:
+            lines.append(f"- **100s / 50s:** {hs}")
+        top = _infobox_field(infobox, f"top score{suffix}")
+        if top:
+            lines.append(f"- **Highest score:** {top}")
+        catches = _infobox_field(infobox, f"catches/stumpings{suffix}")
+        if catches:
+            lines.append(f"- **Catches / stumpings:** {catches}")
+        wickets = _infobox_field(infobox, f"wickets{suffix}")
+        if wickets and wickets not in {"0", "—", "-"}:
+            lines.append(f"- **Wickets:** {wickets}")
+            bowl = _infobox_field(infobox, f"bowl avg{suffix}")
+            best = _infobox_field(infobox, f"best bowling{suffix}")
+            if bowl:
+                lines.append(f"- **Bowling average:** {bowl}")
+            if best:
+                lines.append(f"- **Best bowling:** {best}")
+
+        prefix = fmt
+        cap = _infobox_field(infobox, f"{prefix}cap")
+        if cap:
+            lines.append(f"- **Caps:** {cap}")
+        debut = " ".join(
+            x
+            for x in (
+                _infobox_field(infobox, f"{prefix}debutdate"),
+                _infobox_field(infobox, f"{prefix}debutyear"),
+            )
+            if x
+        )
+        debut_vs = _infobox_field(infobox, f"{prefix}debutagainst")
+        if debut:
+            lines.append(f"- **Debut:** {debut}" + (f" vs {debut_vs}" if debut_vs else ""))
+        last = " ".join(
+            x
+            for x in (
+                _infobox_field(infobox, f"last{prefix}date"),
+                _infobox_field(infobox, f"last{prefix}year"),
+            )
+            if x
+        )
+        last_vs = _infobox_field(infobox, f"last{prefix}against")
+        if last:
+            lines.append(f"- **Last match:** {last}" + (f" vs {last_vs}" if last_vs else ""))
+
+    lines.append("")
+    src = profile_url or wiki_url
+    if profile_url and wiki_url:
+        lines.append(f"Sources: [Wikipedia]({wiki_url}) · [ESPNcricinfo]({profile_url})")
+    elif profile_url:
+        lines.append(f"Source: [ESPNcricinfo]({profile_url})")
+    else:
+        lines.append(f"Source: [Wikipedia]({wiki_url})")
+    return "\n".join(lines)
+
+
+def handle_cricket_player_stats(query: str) -> HandlerResult | None:
+    parsed = _parse_cricket_stats_query(query)
+    if not parsed:
+        return None
+    fmt, player = parsed
+    resolved = _resolve_cricket_player_page(player)
+    if not resolved:
+        return None
+    display_name, wiki_title, profile_url = resolved
+    wiki = _fetch_wikipedia_wikitext(wiki_title)
+    if not wiki:
+        return None
+    wikitext, wiki_url = wiki
+    infobox = _find_cricket_infobox(wikitext)
+    if not infobox:
+        return None
+    answer = _format_cricket_stats_answer(
+        display_name,
+        fmt,
+        infobox,
+        wiki_url=wiki_url,
+        profile_url=profile_url,
+    )
+    if not answer:
+        return None
+    sources = [
+        {"title": f"Wikipedia · {wiki_title}", "snippet": answer[:280], "url": wiki_url},
+    ]
+    if profile_url:
+        sources.append(
+            {"title": f"ESPNcricinfo · {display_name}", "snippet": f"{display_name} player profile", "url": profile_url}
+        )
+    return HandlerResult(
+        direct_answer=answer,
+        context_blocks=[answer],
+        sources=sources,
+        handler="cricket_stats",
+        source_label=f"Live · {CRICKET_FORMAT_LABEL.get(fmt, fmt.upper())} stats",
+        live_data=True,
+        use_direct=True,
+    )
+
+
 def _wikipedia_extract(title: str) -> tuple[str, str] | None:
     url = (
         "https://en.wikipedia.org/w/api.php"
@@ -1173,6 +1556,7 @@ def _wikipedia_extract(title: str) -> tuple[str, str] | None:
 
 
 API_HANDLERS: list[tuple[str, object]] = [
+    ("cricket_stats", handle_cricket_player_stats),
     ("time", handle_time),
     ("fx", handle_fx),
     ("crypto", handle_crypto),

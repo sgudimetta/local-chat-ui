@@ -28,14 +28,16 @@ html, body {
 }
 
 .app {
+  --sidebar-width: 260px;
   display: flex;
   height: 100vh;
 }
 
 /* Sidebar */
 .sidebar {
-  width: 260px;
-  min-width: 260px;
+  width: var(--sidebar-width);
+  min-width: 200px;
+  max-width: 480px;
   min-height: 0;
   background: var(--sidebar);
   border-right: 1px solid var(--border);
@@ -44,6 +46,39 @@ html, body {
   padding: 16px;
   gap: 12px;
   overflow: hidden;
+  flex-shrink: 0;
+}
+
+.sidebar-resizer {
+  width: 5px;
+  margin: 0 -2px;
+  cursor: col-resize;
+  flex-shrink: 0;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+  transition: background 0.15s;
+}
+
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+  background: var(--border);
+}
+
+.sidebar-resizer:hover,
+.sidebar-resizer:focus-visible,
+body.sidebar-resizing .sidebar-resizer {
+  background: rgba(99, 102, 241, 0.15);
+}
+
+body.sidebar-resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .sidebar-header {
@@ -1336,6 +1371,7 @@ html, body {
 }
 
 @media (max-width: 768px) {
-  .sidebar { display: none; }
+  .sidebar,
+  .sidebar-resizer { display: none; }
   .welcome { margin-top: 5vh; }
 }

@@ -15,7 +15,7 @@ import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from web_search import build_web_context, query_needs_verification
+from web_search import build_web_context, query_is_conversational, query_needs_verification
 from repo_tools import (
     get_repo_root,
     grep_repo,
@@ -340,7 +340,7 @@ class ChatHandler(SimpleHTTPRequestHandler):
         ram_tier = payload.get("ram_tier")
         if ram_tier == "tiny" or (low_ram and (system_ram_gb() or 99) <= 8):
             keep = "2m"
-        elif low_ram or ram_tier == "low":
+        elif low_ram:
             keep = "5m"
         else:
             keep = "30m"
@@ -388,7 +388,7 @@ class ChatHandler(SimpleHTTPRequestHandler):
         ram_tier = payload.pop("ram_tier", None)
         if ram_tier == "tiny" or (low_ram and (system_ram_gb() or 99) <= 8):
             keep = "2m"
-        elif low_ram or ram_tier == "low":
+        elif low_ram:
             keep = "5m"
         else:
             keep = "30m"
@@ -651,8 +651,10 @@ class ChatHandler(SimpleHTTPRequestHandler):
         if not last_user:
             return payload, None
 
+        if query_is_conversational(last_user):
+            return payload, None
+
         verify_facts = verify_facts or query_needs_verification(last_user)
-        force_search = force_search or True
 
         result = build_web_context(last_user, force_search=force_search)
         context = result["context"]
@@ -677,6 +679,8 @@ class ChatHandler(SimpleHTTPRequestHandler):
         )
         web_rules = (
             "WEB SEARCH RESULTS are below. Answer like a top-tier assistant — direct, specific, complete.\n\n"
+            "The user's latest message is part of an ongoing chat — use prior messages for context.\n"
+            "If they only said thanks, ok, or a brief follow-up, reply naturally in one short sentence.\n\n"
             "Rules — follow strictly:\n"
             "1. Use the reference material as your primary source. Training memory is secondary.\n"
             "2. For dates, schedules, scores, prices, names, versions: take facts from the reference.\n"

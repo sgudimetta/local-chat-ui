@@ -88,7 +88,7 @@ const DEFAULTS = {
   fastMode: false,
   unloadOnClose: true,
   lowRamMode: false,
-  autoUnloadOnPressure: true,
+  autoUnloadOnPressure: false,
   autoUnloadIdle: false,
   chatMode: "ask",
   repoPath: "",
@@ -313,7 +313,7 @@ function saveSettings() {
       fastMode: fastModeToggle.checked,
       unloadOnClose: unloadOnCloseToggle.checked,
       lowRamMode: lowRamModeToggle?.checked ?? false,
-      autoUnloadOnPressure: autoUnloadPressureToggle?.checked ?? true,
+      autoUnloadOnPressure: autoUnloadPressureToggle?.checked ?? false,
       autoUnloadIdle: autoUnloadIdleToggle?.checked ?? false,
       chatMode,
       repoPath: repoPathInput?.value?.trim() || "",
@@ -725,11 +725,15 @@ function saveChat() {
   saveChats();
 }
 
-/** Web search ON → search by default for any non-creative query (ChatGPT-style). */
+/** Web search ON → search only when the message needs live or factual lookup. */
 const WEB_FORCE_PREFIX = /^\/search\s+/i;
 
 const WEB_EXPLICIT_SEARCH =
   /\b(look up online|search the web|search online|find online|check online|google this)\b/i;
+
+/** Social / ack messages — never hit the web. */
+const CONVERSATIONAL_ONLY =
+  /^(?:(?:thanks?(?:\s+(?:a\s+lot|so\s+much|very\s+much))?|thank\s+you(?:\s+so\s+much|\s+very\s+much)?|thx|ty|cheers|much\s+appreciated|appreciate\s+it)|(?:that(?:'s| is)\s+(?:helpful|great|perfect|awesome|good|useful))|(?:ok(?:ay)?|k|cool|nice|great|perfect|got\s+it|understood|makes\s+sense|sounds\s+good|will\s+do|noted|awesome|lovely|brilliant)|(?:hello|hi|hey|yo|good\s+(?:morning|afternoon|evening|night))|(?:how\s+(?:are\s+you|you\s+doing|goes\s+it))|(?:bye|goodbye|see\s+(?:you|ya)|take\s+care|later)|(?:yes|no|yep|nope|sure)|(?:can\s+you\s+)?(?:elaborate|explain\s+more|tell\s+me\s+more|go\s+on|continue|more\s+detail|expand(?:\s+on\s+that)?|say\s+more))(?:[!.?\s,]*)*$/iu;
 
 /** Pure creative/code tasks — skip web even when toggle is on. */
 const WEB_LOCAL_CREATIVE =
@@ -792,13 +796,53 @@ function needsFactVerification(text) {
   return false;
 }
 
+function isConversationalOnly(text) {
+  const t = text.trim();
+  if (!t || t.length > 120) return false;
+  if (CONVERSATIONAL_ONLY.test(t)) return true;
+  if (
+    t.length <= 20 &&
+    !/\?/.test(t) &&
+    !looksLikeFactualLookup(t) &&
+    !WEB_LOCAL_ONLY.test(t) &&
+    !/\b(who|what|when|where|why|how|which)\b/i.test(t)
+  ) {
+    return /^[\w\s'".,!-]+$/i.test(t);
+  }
+  return false;
+}
+
+function looksLikeFactualLookup(text) {
+  const t = text.trim();
+  if (!t) return false;
+  if (WEB_FORCE_PREFIX.test(t) || WEB_EXPLICIT_SEARCH.test(t)) return true;
+  if (needsFactVerification(t)) return true;
+  if (matchesLiveTopics(t)) return true;
+  if (WEB_LIVE_REQUIRED.test(t)) return true;
+  if (
+    /\b(odi|test|t20|stats|statistics|weather|price|score|population|capital|who won|exchange rate|headline|news today)\b/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (/^(?:who|what|when|where|which|how many|how much|tell me|give me|show me|list|is there|are there)\b/i.test(t)) {
+    return true;
+  }
+  if (/\?\s*$/.test(t) && !WEB_LOCAL_ONLY.test(t)) return true;
+  if (/\b(what is|what's|who is|who's|where is|when is|how old)\b/i.test(t)) return true;
+  return false;
+}
+
 function needsLiveWebSearch(text) {
   const t = text.trim();
   if (!t) return false;
   if (WEB_FORCE_PREFIX.test(t)) return true;
   if (WEB_EXPLICIT_SEARCH.test(t)) return true;
   if (isClearlyLocalCreative(t)) return false;
-  return true;
+  if (isConversationalOnly(t)) return false;
+  if (WEB_LOCAL_ONLY.test(t) && !looksLikeFactualLookup(t)) return false;
+  return looksLikeFactualLookup(t);
 }
 
 const WEB_CREATIVE_SKIP =
@@ -820,14 +864,16 @@ function queryForWebSearch(text) {
 }
 
 const DEFAULT_ASSISTANT_PROMPT =
-  "You are a knowledgeable, careful assistant. Accuracy and clarity matter more than speed.\n\n" +
-  "Before you answer (silently — do not show this planning):\n" +
-  "- Identify what the user is really asking and which context applies.\n" +
-  "- Outline the key points you will cover.\n\n" +
+  "You are a knowledgeable, careful assistant in an ongoing conversation. Accuracy and clarity matter.\n\n" +
+  "Use the full thread — the latest message may be a follow-up, thanks, or clarification on what came before.\n\n" +
+  "Before you answer (silently — do not show planning):\n" +
+  "- Decide what the user wants now: new facts, explanation, writing help, or a brief social reply.\n" +
+  "- For thanks, hi, ok, got it: one short warm sentence — do not repeat the prior answer or search the web.\n" +
+  "- For follow-ups (e.g. 'what about test stats?'), use context from earlier messages.\n\n" +
   "In your reply:\n" +
-  "- Give only the final, polished answer — no visible brainstorming or 'let me think' preamble.\n" +
-  "- Be specific and structured (short intro, then bullets or steps where helpful).\n" +
-  "- If uncertain, say so briefly rather than guessing or telling the user to look elsewhere.\n\n" +
+  "- Give only the final, polished answer — no visible brainstorming.\n" +
+  "- Be specific and structured when the question needs detail; stay brief for social messages.\n" +
+  "- If uncertain, say so briefly rather than guessing.\n\n" +
   "Answer from your own knowledge for explanations, writing, coding, advice, and comparisons.";
 
 const ATTACHMENT_SYSTEM_PROMPT =
@@ -1313,7 +1359,6 @@ function applySystemPrompt(chat, text) {
 function pickBestModel(models, ramGb = systemRamGb) {
   const tier = memoryTier(ramGb);
   const safeForTiny = models.filter((m) => isLightModel(m));
-  const safeForLow = models.filter((m) => !isHeavyModel(m) && !isMediumModel(m));
 
   if (tier === "tiny" && safeForTiny.length) {
     const prefer = [
@@ -1327,19 +1372,6 @@ function pickBestModel(models, ramGb = systemRamGb) {
       if (match) return match;
     }
     return safeForTiny[0];
-  }
-
-  if (tier === "low" && safeForLow.length) {
-    const prefer = [
-      (m) => /llama3\.1:8b|llama3:8b/.test(m),
-      (m) => /llama3\.2:1b|llama3\.2:3b/.test(m),
-      (m) => /8b|7b/.test(m),
-    ];
-    for (const test of prefer) {
-      const match = safeForLow.find(test);
-      if (match) return match;
-    }
-    return safeForLow[0];
   }
 
   const has32 = (m) => /32b|70b/.test(m);
@@ -1392,12 +1424,8 @@ function updateModelHint(models) {
     if (is32 || is14) {
       modelHintEl.textContent = `⚠ ${ram} GB RAM — ${selected} is too large. Use llama3.2:1b or llama3.1:8b`;
     } else {
-      modelHintEl.textContent = `${ram} GB RAM — keep Low RAM mode on; Stop server when using Cursor heavily`;
+      modelHintEl.textContent = `${ram} GB RAM — enable Low RAM mode in Options if Cursor feels sluggish`;
     }
-    return;
-  }
-  if (tier === "low" && (is32 || is14)) {
-    modelHintEl.textContent = `⚠ ${ram} GB RAM — ${selected} may choke the system; prefer 8B models`;
     return;
   }
 
@@ -1414,10 +1442,6 @@ function updateModelHint(models) {
   }
   if (ram != null && ram >= 24 && !models.some((m) => /14b|32b|70b/.test(m))) {
     modelHintEl.textContent = "More RAM? Try: ollama pull qwen3:14b";
-    return;
-  }
-  if (tier === "low") {
-    modelHintEl.textContent = `${ram} GB RAM — Low RAM mode recommended with 8B models`;
     return;
   }
   modelHintEl.textContent = "";
@@ -1461,7 +1485,6 @@ const HEAL_COOLDOWN_MS = 45 * 1000;
 function memoryTier(ramGb = systemRamGb) {
   if (ramGb == null) return "normal";
   if (ramGb <= 8) return "tiny";
-  if (ramGb <= 16) return "low";
   return "normal";
 }
 
@@ -1490,26 +1513,19 @@ function isLightModel(name) {
 }
 
 function applyRamTierDefaults(ramGb) {
-  if (!ramGb) return;
-  const tier = memoryTier(ramGb);
-  const key = `ramTierDefaults_${tier}`;
+  if (!ramGb || ramGb > 8) return;
+  const key = "ramTierDefaults_tiny";
   if (localStorage.getItem(key)) return;
   localStorage.setItem(key, "1");
 
-  if (tier === "tiny") {
-    if (lowRamModeToggle) lowRamModeToggle.checked = true;
-    if (autoUnloadPressureToggle) autoUnloadPressureToggle.checked = true;
-    if (autoUnloadIdleToggle) autoUnloadIdleToggle.checked = true;
-    saveSettings();
-    appendSystemNotice(
-      `**${ramGb} GB RAM detected** — Low RAM mode and auto-free options are on. ` +
-        "Use **llama3.2:1b** or **llama3.1:8b** only; 14B/32B models will choke the system.",
-    );
-  } else if (tier === "low") {
-    appendSystemNotice(
-      `**${ramGb} GB RAM detected** — enable **Low RAM mode** in Options if Cursor feels sluggish with 8B models.`,
-    );
-  }
+  if (lowRamModeToggle) lowRamModeToggle.checked = true;
+  if (autoUnloadPressureToggle) autoUnloadPressureToggle.checked = true;
+  if (autoUnloadIdleToggle) autoUnloadIdleToggle.checked = true;
+  saveSettings();
+  appendSystemNotice(
+    `**${ramGb} GB RAM detected** — Low RAM mode and auto-free options are on. ` +
+      "Use **llama3.2:1b** or **llama3.1:8b** only; 14B/32B models will choke the system.",
+  );
 }
 
 function touchChatActivity() {
@@ -1574,7 +1590,6 @@ function applyResourceUi(snap) {
 
   if (statusDot && !streaming) {
     if (snap.memory_pressure === "critical") statusDot.className = "status-dot warn";
-    else if (snap.memory_pressure === "warn") statusDot.className = "status-dot warn";
   }
   refreshComposerState();
 }
@@ -1607,15 +1622,23 @@ async function refreshResources() {
   const snap = await fetchSystemSnapshot();
   applyResourceUi(snap);
   await maybeAutoFreeRam(snap);
+  scheduleResourcePoll();
   return snap;
 }
 
 function scheduleResourcePoll() {
   clearInterval(resourcePollTimer);
-  resourcePollTimer = setInterval(() => {
+  const tick = () => {
     if (serverActionInProgress) return;
     refreshResources();
-  }, 8000);
+  };
+  const intervalMs =
+    systemSnapshot?.memory_pressure === "critical"
+      ? 15000
+      : systemSnapshot?.memory_pressure === "warn"
+        ? 30000
+        : 60000;
+  resourcePollTimer = setInterval(tick, intervalMs);
 }
 
 async function freeModelRam() {
@@ -1744,30 +1767,10 @@ function getComposerBlockReason() {
       actionLabel: "Pick safe model",
     };
   }
-  if (memoryTier() === "low" && isHeavyModel(selected)) {
-    return {
-      level: "error",
-      message: `${selected} will choke a ${systemRamGb} GB Mac — use an 8B model instead`,
-      canSend: false,
-      canType: true,
-      action: "retry_models",
-      actionLabel: "Pick smaller model",
-    };
-  }
-  if (systemSnapshot?.memory_pressure === "critical") {
+  if (systemSnapshot?.memory_pressure === "critical" && systemSnapshot?.should_unload) {
     return {
       level: "error",
       message: `Memory tight (${systemSnapshot.memory_message || "system is under pressure"}). Free model RAM or use Stop server.`,
-      canSend: true,
-      canType: true,
-      action: "free_ram",
-      actionLabel: "Free model RAM",
-    };
-  }
-  if (systemSnapshot?.memory_pressure === "warn" && systemSnapshot?.ollama_vram_gb > 0) {
-    return {
-      level: "warn",
-      message: systemSnapshot.memory_message || "High memory use — Cursor may feel slow.",
       canSend: true,
       canType: true,
       action: "free_ram",
@@ -1935,7 +1938,11 @@ function scheduleHealthWatchdog() {
             : "No response from model (memory or Ollama stall) — recovering…",
         );
         streamAbort?.abort();
-        if (systemSnapshot?.ollama_vram_gb > 0 && autoUnloadPressureToggle?.checked) {
+        if (
+          memoryTier() === "tiny" &&
+          systemSnapshot?.ollama_vram_gb > 0 &&
+          autoUnloadPressureToggle?.checked
+        ) {
           await unloadModels();
         }
         resetStreamingState("Request timed out. Try again, or enable **Low RAM mode** in Options.");
@@ -1959,7 +1966,7 @@ function scheduleHealthWatchdog() {
     } catch {
       /* ignore transient network blips */
     }
-  }, 10000);
+  }, 15000);
 }
 
 composerStatusEl?.addEventListener("click", (e) => {
@@ -2028,7 +2035,7 @@ function scheduleServerPoll() {
         }
       }
     });
-  }, 5000);
+  }, 15000);
 }
 
 async function toggleServer() {
@@ -2240,11 +2247,7 @@ async function loadModels() {
       /* ignore */
     }
     if (savedModel && models.includes(savedModel)) {
-      const tier = memoryTier();
-      if (tier === "tiny" && (isHeavyModel(savedModel) || isMediumModel(savedModel))) {
-        modelSelect.value = pickBestModel(models);
-        saveSettings();
-      } else if (tier === "low" && isHeavyModel(savedModel)) {
+      if (memoryTier() === "tiny" && (isHeavyModel(savedModel) || isMediumModel(savedModel))) {
         modelSelect.value = pickBestModel(models);
         saveSettings();
       } else {
@@ -2438,7 +2441,7 @@ function buildPayload() {
     low_ram_mode: lowRamModeToggle?.checked ?? false,
     ram_tier: memoryTier(),
     web_search: useWeb,
-    web_search_force: useWeb || isForcedWebSearch(lastUser) || verify,
+    web_search_force: useWeb && (isForcedWebSearch(lastUser) || verify),
     verify_facts: verify,
     web_search_query: useWeb ? queryForWebSearch(lastUser) : undefined,
   };
@@ -2843,8 +2846,85 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+const SIDEBAR_WIDTH_KEY = "sidebarWidth";
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 480;
+
+function applySidebarWidth(px) {
+  const width = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, px));
+  document.documentElement.style.setProperty("--sidebar-width", `${width}px`);
+  return width;
+}
+
+function initSidebarResize() {
+  const resizer = document.getElementById("sidebar-resizer");
+  if (!resizer) return;
+
+  try {
+    const saved = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY) || "", 10);
+    if (saved >= SIDEBAR_MIN && saved <= SIDEBAR_MAX) applySidebarWidth(saved);
+  } catch {
+    /* ignore */
+  }
+
+  let startX = 0;
+  let startWidth = 0;
+
+  const onMove = (clientX) => {
+    const next = applySidebarWidth(startWidth + clientX - startX);
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+  };
+
+  const stop = () => {
+    document.body.classList.remove("sidebar-resizing");
+    window.removeEventListener("mousemove", onMouseMove);
+    window.removeEventListener("mouseup", stop);
+    window.removeEventListener("touchmove", onTouchMove);
+    window.removeEventListener("touchend", stop);
+  };
+
+  const onMouseMove = (e) => onMove(e.clientX);
+  const onTouchMove = (e) => {
+    if (e.touches[0]) onMove(e.touches[0].clientX);
+  };
+
+  const start = (clientX) => {
+    startX = clientX;
+    startWidth = document.getElementById("sidebar")?.getBoundingClientRect().width || 260;
+    document.body.classList.add("sidebar-resizing");
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", stop);
+    window.addEventListener("touchmove", onTouchMove, { passive: true });
+    window.addEventListener("touchend", stop);
+  };
+
+  resizer.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    start(e.clientX);
+  });
+  resizer.addEventListener(
+    "touchstart",
+    (e) => {
+      if (e.touches[0]) start(e.touches[0].clientX);
+    },
+    { passive: true },
+  );
+  resizer.addEventListener("keydown", (e) => {
+    const sidebar = document.getElementById("sidebar");
+    const current = sidebar?.getBoundingClientRect().width || 260;
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(applySidebarWidth(current - 16)));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(applySidebarWidth(current + 16)));
+    }
+  });
+}
+
 async function bootstrap() {
   loadSettings();
+  initSidebarResize();
   setChatMode(chatMode);
   await loadChats();
   await refreshServerStatus();
