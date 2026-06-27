@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import operator
 import re
 import subprocess
 import time
@@ -154,6 +156,85 @@ CONVERSATIONAL_ONLY_PATTERN = re.compile(
     r")(?:[!.?\s,]*)*$"
 )
 
+MATH_PREFIX = re.compile(
+    r"(?i)^(?:what(?:'s| is)|how much is|calculate|compute|evaluate|solve(?: for)?)\s+"
+)
+
+_MATH_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _normalize_math_expr(raw: str) -> str:
+    text = raw.strip().rstrip("?").strip()
+    text = MATH_PREFIX.sub("", text).strip()
+    return text.replace("×", "*").replace("÷", "/")
+
+
+def query_is_simple_math(query: str) -> bool:
+    q = FORCE_SEARCH_PREFIX.sub("", query).strip()
+    expr = _normalize_math_expr(q)
+    if not expr or len(expr) > 40:
+        return False
+    if not re.match(r"^[\d\s+\-*/().^%,]+$", expr):
+        return False
+    return bool(re.search(r"\d", expr) and re.search(r"[\+\-\*/]", expr))
+
+
+def _eval_math_node(node: ast.AST) -> int | float:
+    if isinstance(node, ast.Expression):
+        return _eval_math_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _MATH_OPS:
+        return _MATH_OPS[type(node.op)](_eval_math_node(node.operand))  # type: ignore[operator]
+    if isinstance(node, ast.BinOp) and type(node.op) in _MATH_OPS:
+        return _MATH_OPS[type(node.op)](_eval_math_node(node.left), _eval_math_node(node.right))  # type: ignore[operator]
+    raise ValueError("unsupported expression")
+
+
+def evaluate_math_expression(expr: str) -> int | float:
+    normalized = _normalize_math_expr(expr)
+    tree = ast.parse(normalized, mode="eval")
+    return _eval_math_node(tree)
+
+
+def _format_math_result(value: int | float) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, float):
+        text = f"{value:.10g}"
+        return text
+    return str(value)
+
+
+def handle_simple_math(query: str) -> HandlerResult | None:
+    if not query_is_simple_math(query):
+        return None
+    expr = _normalize_math_expr(query)
+    try:
+        result = evaluate_math_expression(expr)
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
+        return None
+    answer = f"**{_format_math_result(result)}**"
+    return HandlerResult(
+        direct_answer=answer,
+        context_blocks=[f"{expr} = {_format_math_result(result)}"],
+        sources=[],
+        handler="math",
+        source_label="Local · math",
+        live_data=False,
+        use_direct=True,
+    )
+
+
 FACTUAL_QUERY_PATTERN = re.compile(
     r"(?i)\b(who|what|when|where|which|how many|how much|tell me|give me)\b|"
     r"\b(when is|what is|what's|who is|who's|where is|how old|next|upcoming|"
@@ -268,6 +349,8 @@ def query_is_conversational(query: str) -> bool:
 def query_looks_factual(query: str) -> bool:
     q = FORCE_SEARCH_PREFIX.sub("", query).strip()
     if not q:
+        return False
+    if query_is_simple_math(q):
         return False
     if FORCE_SEARCH_PREFIX.search(query) or re.search(
         r"(?i)\b(look up online|search the web|search online|find online|check online|google this)\b", q
@@ -1556,6 +1639,7 @@ def _wikipedia_extract(title: str) -> tuple[str, str] | None:
 
 
 API_HANDLERS: list[tuple[str, object]] = [
+    ("math", handle_simple_math),
     ("cricket_stats", handle_cricket_player_stats),
     ("time", handle_time),
     ("fx", handle_fx),

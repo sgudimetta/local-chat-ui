@@ -812,9 +812,19 @@ function isConversationalOnly(text) {
   return false;
 }
 
+function isSimpleMathQuery(text) {
+  let t = text.trim().replace(/\?+$/, "").trim();
+  t = t.replace(/^(?:what(?:'s| is)|how much is|calculate|compute|evaluate|solve(?: for)?)\s+/i, "").trim();
+  t = t.replace(/×/g, "*").replace(/÷/g, "/");
+  if (!t || t.length > 40) return false;
+  if (!/^[\d\s+\-*/().^%,]+$/i.test(t)) return false;
+  return /\d/.test(t) && /[\+\-*\/]/.test(t);
+}
+
 function looksLikeFactualLookup(text) {
   const t = text.trim();
   if (!t) return false;
+  if (isSimpleMathQuery(t)) return false;
   if (WEB_FORCE_PREFIX.test(t) || WEB_EXPLICIT_SEARCH.test(t)) return true;
   if (needsFactVerification(t)) return true;
   if (matchesLiveTopics(t)) return true;
@@ -852,6 +862,7 @@ function shouldWebSearch(text) {
   if (!webSearchToggle?.checked) return false;
   const t = text.trim();
   if (!t) return false;
+  if (isSimpleMathQuery(t)) return true;
   return needsLiveWebSearch(t);
 }
 
@@ -869,6 +880,7 @@ const DEFAULT_ASSISTANT_PROMPT =
   "Before you answer (silently — do not show planning):\n" +
   "- Decide what the user wants now: new facts, explanation, writing help, or a brief social reply.\n" +
   "- For thanks, hi, ok, got it: one short warm sentence — do not repeat the prior answer or search the web.\n" +
+  "- For simple arithmetic (e.g. 3×3), give the numeric answer directly — no calculator steps unless asked.\n" +
   "- For follow-ups (e.g. 'what about test stats?'), use context from earlier messages.\n\n" +
   "In your reply:\n" +
   "- Give only the final, polished answer — no visible brainstorming.\n" +
@@ -920,9 +932,17 @@ function pickModelForTurn(text) {
 }
 
 function pickVisionModel(models) {
-  const priority = [
-    (m) => /llava|llama3\.2-vision|bakllava|moondream|minicpm-v|qwen2\.5vl|qwen3-vl/i.test(m),
-  ];
+  const tiny = memoryTier() === "tiny";
+  const priority = tiny
+    ? [
+        (m) => /moondream/i.test(m),
+        (m) => /minicpm-v|bakllava/i.test(m),
+        (m) => /llava|llama3\.2-vision|qwen2\.5vl|qwen3-vl/i.test(m),
+      ]
+    : [
+        (m) => /llava|llama3\.2-vision|qwen2\.5vl|qwen3-vl/i.test(m),
+        (m) => /moondream|minicpm-v|bakllava/i.test(m),
+      ];
   for (const test of priority) {
     const match = models.find(test);
     if (match) return match;
@@ -1472,15 +1492,19 @@ let healInProgress = false;
 let healthWatchdogTimer = null;
 let lastHealAt = 0;
 
+let activeVisionRequest = false;
+
 const IDLE_UNLOAD_MS = 10 * 60 * 1000;
-const IDLE_UNLOAD_MS_TINY = 5 * 60 * 1000;
+const IDLE_UNLOAD_MS_TINY = 10 * 60 * 1000;
 const AUTO_UNLOAD_COOLDOWN_MS = 3 * 60 * 1000;
 const STREAM_STALL_MS = 2 * 60 * 1000;
-const STREAM_STALL_MS_TINY = 90 * 1000;
+const STREAM_STALL_MS_TINY = 3 * 60 * 1000;
+const STREAM_STALL_VISION_MS = 12 * 60 * 1000;
 const STREAM_MAX_MS = 12 * 60 * 1000;
-const STREAM_MAX_MS_TINY = 8 * 60 * 1000;
-const COMPOSER_STUCK_MS = 25 * 1000;
-const HEAL_COOLDOWN_MS = 45 * 1000;
+const STREAM_MAX_MS_TINY = 10 * 60 * 1000;
+const STREAM_MAX_VISION_MS = 18 * 60 * 1000;
+const COMPOSER_STUCK_MS = 120 * 1000;
+const HEAL_COOLDOWN_MS = 120 * 1000;
 
 function memoryTier(ramGb = systemRamGb) {
   if (ramGb == null) return "normal";
@@ -1493,10 +1517,12 @@ function idleUnloadMs() {
 }
 
 function streamStallMs() {
+  if (activeVisionRequest || hasImageAttachments()) return STREAM_STALL_VISION_MS;
   return memoryTier() === "tiny" ? STREAM_STALL_MS_TINY : STREAM_STALL_MS;
 }
 
 function streamMaxMs() {
+  if (activeVisionRequest || hasImageAttachments()) return STREAM_MAX_VISION_MS;
   return memoryTier() === "tiny" ? STREAM_MAX_MS_TINY : STREAM_MAX_MS;
 }
 
@@ -1514,17 +1540,14 @@ function isLightModel(name) {
 
 function applyRamTierDefaults(ramGb) {
   if (!ramGb || ramGb > 8) return;
-  const key = "ramTierDefaults_tiny";
+  const key = "ramTierDefaults_tiny_v2";
   if (localStorage.getItem(key)) return;
   localStorage.setItem(key, "1");
 
   if (lowRamModeToggle) lowRamModeToggle.checked = true;
-  if (autoUnloadPressureToggle) autoUnloadPressureToggle.checked = true;
-  if (autoUnloadIdleToggle) autoUnloadIdleToggle.checked = true;
   saveSettings();
   appendSystemNotice(
-    `**${ramGb} GB RAM detected** — Low RAM mode and auto-free options are on. ` +
-      "Use **llama3.2:1b** or **llama3.1:8b** only; 14B/32B models will choke the system.",
+    `**${ramGb} GB RAM detected** — Low RAM mode is on. Use **llama3.2:1b** or a small vision model for images; auto-unload stays off unless you enable it in Options.`,
   );
 }
 
@@ -1579,7 +1602,7 @@ function applyResourceUi(snap) {
   }
 
   if (resourceWarnEl) {
-    if (snap.memory_pressure !== "normal" && snap.memory_message) {
+    if (snap.memory_pressure === "critical" && snap.memory_message) {
       resourceWarnEl.textContent = snap.memory_message;
       resourceWarnEl.classList.remove("hidden");
     } else {
@@ -1590,18 +1613,25 @@ function applyResourceUi(snap) {
 
   if (statusDot && !streaming) {
     if (snap.memory_pressure === "critical") statusDot.className = "status-dot warn";
+    else if (statusDot.className === "status-dot warn") statusDot.className = "status-dot ok";
   }
-  refreshComposerState();
+  if (!streaming) refreshComposerState();
 }
 
 async function maybeAutoFreeRam(snap) {
   if (!snap || streaming || serverActionInProgress || !serverRunning) return;
+  if (activeVisionRequest || hasImageAttachments()) return;
   const models = snap.ollama_models || [];
   if (!models.length) return;
   if (Date.now() - lastAutoUnloadAt < AUTO_UNLOAD_COOLDOWN_MS) return;
+  if (memoryTier() !== "tiny" && !autoUnloadPressureToggle?.checked && !autoUnloadIdleToggle?.checked) {
+    return;
+  }
 
   let reason = null;
-  if (autoUnloadPressureToggle?.checked && snap.should_unload) {
+  if (memoryTier() === "tiny" && autoUnloadPressureToggle?.checked && snap.should_unload) {
+    reason = snap.memory_message || "System memory is tight.";
+  } else if (autoUnloadPressureToggle?.checked && snap.should_unload) {
     reason = snap.memory_message || "System memory is tight.";
   }
   if (
@@ -1629,7 +1659,7 @@ async function refreshResources() {
 function scheduleResourcePoll() {
   clearInterval(resourcePollTimer);
   const tick = () => {
-    if (serverActionInProgress) return;
+    if (serverActionInProgress || streaming || activeVisionRequest) return;
     refreshResources();
   };
   const intervalMs =
@@ -1905,12 +1935,20 @@ async function attemptSelfHeal(force = false) {
     }
 
     const snap = await refreshResources();
-    if (snap?.should_unload && autoUnloadPressureToggle?.checked) {
+    if (
+      snap?.should_unload &&
+      autoUnloadPressureToggle?.checked &&
+      memoryTier() === "tiny" &&
+      !activeVisionRequest &&
+      !hasImageAttachments()
+    ) {
       await unloadModels();
       appendSystemNotice("Freed model RAM automatically — memory was critically low.");
     }
 
-    appendSystemNotice("**Recovered** — you can send again.");
+    if (force) {
+      appendSystemNotice("**Recovered** — you can send again.");
+    }
     return true;
   } catch (e) {
     appendSystemNotice(`Recovery failed: ${e.message || e}. Try **Start server** or **Free model RAM**.`);
@@ -1924,44 +1962,53 @@ async function attemptSelfHeal(force = false) {
 function scheduleHealthWatchdog() {
   clearInterval(healthWatchdogTimer);
   healthWatchdogTimer = setInterval(async () => {
-    if (healInProgress || serverActionInProgress) return;
+    if (healInProgress || serverActionInProgress || activeVisionRequest) return;
 
     if (streaming && streamStartedAt) {
       const silent = lastStreamActivityAt ? Date.now() - lastStreamActivityAt : Date.now() - streamStartedAt;
       const total = Date.now() - streamStartedAt;
       const maxMs = streamMaxMs();
+      const vision = activeVisionRequest;
+
+      if (vision) {
+        if (total > maxMs) {
+          appendSystemNotice("Image request timed out — the vision model may be too large for available RAM.");
+          streamAbort?.abort();
+          resetStreamingState("Vision request timed out. Try a smaller vision model (e.g. moondream or llava).");
+        }
+        return;
+      }
+
       const stallMs = streamStallMs();
       if (total > maxMs || silent > stallMs) {
         appendSystemNotice(
           total > maxMs
-            ? "Request took too long — stopping and freeing resources."
-            : "No response from model (memory or Ollama stall) — recovering…",
+            ? "Request took too long — stopping so you can try again."
+            : "No response from model — stopping the request.",
         );
         streamAbort?.abort();
-        if (
-          memoryTier() === "tiny" &&
-          systemSnapshot?.ollama_vram_gb > 0 &&
-          autoUnloadPressureToggle?.checked
-        ) {
-          await unloadModels();
-        }
-        resetStreamingState("Request timed out. Try again, or enable **Low RAM mode** in Options.");
-        await attemptSelfHeal(true);
+        resetStreamingState("Request timed out. Try again.");
         return;
       }
+      return;
     }
 
-    if (!streaming && sendBtn?.disabled && serverRunning && composerBlockedSince &&
-        Date.now() - composerBlockedSince > COMPOSER_STUCK_MS) {
+    if (
+      !streaming &&
+      sendBtn?.disabled &&
+      serverRunning &&
+      composerBlockedSince &&
+      Date.now() - composerBlockedSince > COMPOSER_STUCK_MS &&
+      !hasImageAttachments()
+    ) {
       await attemptSelfHeal(false);
     }
 
     try {
       const st = await fetchServerStatus();
-      if (serverRunning && !st.running && !streaming) {
+      if (serverRunning && !st.running && !streaming && !activeVisionRequest) {
         applyServerUi(false);
-        appendSystemNotice("Chat worker stopped unexpectedly — click **Start server** or wait for auto-recovery.");
-        await attemptSelfHeal(false);
+        appendSystemNotice("Chat worker stopped unexpectedly — click **Start server**.");
       }
     } catch {
       /* ignore transient network blips */
@@ -2559,6 +2606,7 @@ function editLastUserMessage() {
 
 async function runGeneration(chat, userText) {
   streaming = true;
+  activeVisionRequest = hasImageAttachments();
   setComposerStreaming(true);
 
   const useWeb = shouldWebSearch(userText);
@@ -2665,12 +2713,13 @@ async function runGeneration(chat, userText) {
         /* keep user message */
       }
       await flushChats();
-      if (/502|503|fetch|network|ollama|memory|crash|recover/i.test(String(e.message))) {
+      if (/502|503|fetch|network|ollama|memory|crash|recover/i.test(String(e.message)) && !activeVisionRequest) {
         await attemptSelfHeal(true);
       }
     }
   } finally {
     streaming = false;
+    activeVisionRequest = false;
     streamAbort = null;
     streamStartedAt = 0;
     lastStreamActivityAt = 0;
@@ -2875,40 +2924,60 @@ function initSidebarResize() {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
   };
 
-  const stop = () => {
+  const stopDrag = () => {
     document.body.classList.remove("sidebar-resizing");
     window.removeEventListener("mousemove", onMouseMove);
-    window.removeEventListener("mouseup", stop);
-    window.removeEventListener("touchmove", onTouchMove);
-    window.removeEventListener("touchend", stop);
+    window.removeEventListener("mouseup", stopDrag);
   };
 
-  const onMouseMove = (e) => onMove(e.clientX);
-  const onTouchMove = (e) => {
-    if (e.touches[0]) onMove(e.touches[0].clientX);
+  const onMouseMove = (e) => {
+    e.preventDefault();
+    onMove(e.clientX);
   };
 
-  const start = (clientX) => {
+  const startDrag = (clientX) => {
     startX = clientX;
     startWidth = document.getElementById("sidebar")?.getBoundingClientRect().width || 260;
     document.body.classList.add("sidebar-resizing");
     window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", stop);
-    window.addEventListener("touchmove", onTouchMove, { passive: true });
-    window.addEventListener("touchend", stop);
+    window.addEventListener("mouseup", stopDrag);
   };
 
-  resizer.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    start(e.clientX);
-  });
-  resizer.addEventListener(
-    "touchstart",
-    (e) => {
-      if (e.touches[0]) start(e.touches[0].clientX);
-    },
-    { passive: true },
-  );
+  if (window.PointerEvent) {
+    resizer.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      resizer.setPointerCapture(e.pointerId);
+      startX = e.clientX;
+      startWidth = document.getElementById("sidebar")?.getBoundingClientRect().width || 260;
+      document.body.classList.add("sidebar-resizing");
+
+      const onPointerMove = (ev) => {
+        ev.preventDefault();
+        onMove(ev.clientX);
+      };
+      const onPointerUp = (ev) => {
+        if (resizer.hasPointerCapture(ev.pointerId)) {
+          resizer.releasePointerCapture(ev.pointerId);
+        }
+        document.body.classList.remove("sidebar-resizing");
+        resizer.removeEventListener("pointermove", onPointerMove);
+        resizer.removeEventListener("pointerup", onPointerUp);
+        resizer.removeEventListener("pointercancel", onPointerUp);
+      };
+
+      resizer.addEventListener("pointermove", onPointerMove);
+      resizer.addEventListener("pointerup", onPointerUp);
+      resizer.addEventListener("pointercancel", onPointerUp);
+    });
+  } else {
+    resizer.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      startDrag(e.clientX);
+    });
+  }
+
   resizer.addEventListener("keydown", (e) => {
     const sidebar = document.getElementById("sidebar");
     const current = sidebar?.getBoundingClientRect().width || 260;

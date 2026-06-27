@@ -386,15 +386,24 @@ class ChatHandler(SimpleHTTPRequestHandler):
         fast = payload.pop("fast_mode", False)
         low_ram = payload.pop("low_ram_mode", False)
         ram_tier = payload.pop("ram_tier", None)
+        has_images = bool(payload.get("images"))
         if ram_tier == "tiny" or (low_ram and (system_ram_gb() or 99) <= 8):
-            keep = "2m"
+            keep = "10m" if has_images else "2m"
         elif low_ram:
-            keep = "5m"
+            keep = "10m" if has_images else "5m"
         else:
             keep = "30m"
         payload.setdefault("keep_alive", keep)
         opts = payload.setdefault("options", {})
-        for k, v in self._perf_options(fast).items():
+        perf = self._perf_options(fast)
+        if has_images and ram_tier == "tiny":
+            perf = {
+                **perf,
+                "num_ctx": min(perf.get("num_ctx", 8192), 2048),
+                "num_predict": min(perf.get("num_predict", 3072), 768),
+                "num_batch": min(perf.get("num_batch", 512), 128),
+            }
+        for k, v in perf.items():
             opts.setdefault(k, v)
 
     def _read_body(self) -> bytes:
@@ -719,9 +728,9 @@ class ChatHandler(SimpleHTTPRequestHandler):
         self._inject_attachments(payload)
         payload, search_meta = self._inject_web_search(payload)
         self._inject_repo_context(payload)
-        self._prepare_messages_for_ollama(payload)
         model = payload.get("model", "llama3.1:8b")
         self._apply_perf_options(payload)
+        self._prepare_messages_for_ollama(payload)
 
         if direct_answer := payload.pop("_direct_answer", None):
             self.send_response(200)

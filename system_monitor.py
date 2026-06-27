@@ -162,8 +162,8 @@ def assess_pressure(mem: dict, ollama_vram_gb: float) -> dict:
     tier = _ram_tier(total)
 
     if tier == "tiny":
-        model_frac_warn, used_warn, used_crit = 0.35, 75, 85
-        free_crit, pressure_crit = 0.6, 18
+        model_frac_warn, used_warn, used_crit = 0.38, 82, 92
+        free_crit, pressure_crit = 0.45, 12
     else:
         model_frac_warn, used_warn, used_crit = 0.55, 88, 94
         free_crit, pressure_crit = 0.5, 12
@@ -187,12 +187,12 @@ def assess_pressure(mem: dict, ollama_vram_gb: float) -> dict:
     if pressure_free is not None and pressure_free <= pressure_crit:
         level = "critical"
         message = f"Memory pressure high ({pressure_free:.0f}% free){tier_note} — free model RAM."
-        should_unload = True
+        should_unload = tier == "tiny"
 
     if used_pct is not None and used_pct >= used_crit:
         level = "critical"
         message = f"System RAM ~{used_pct:.0f}% full{tier_note} — free model RAM."
-        should_unload = True
+        should_unload = tier == "tiny"
 
     if free_gb is not None and free_gb < free_crit and ollama_vram_gb > 0 and tier == "tiny":
         level = "critical"
